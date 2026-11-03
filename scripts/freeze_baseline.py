@@ -15,6 +15,7 @@ passrun.py; `--force STAGE[,STAGE]` redoes one; `--stages a,b` limits the run):
     h         pick H: the first of 5, 15, 30, 60 whose IC is more than 2 standard errors above zero
     sizing    cap MAX_STORIES so the accuracy replay takes <= 360 s at the baseline's ms per headline
     sync      refuse a dirty serving/ or infosys/, then rsync the checkout and the store to the cluster
+    probe     (not in the default run) GPU job: the fixture pass in forced wrapper mode, umount and latency probes
     f1        GPU job: the accuracy checker on the baseline, with the gate's own drain (report mode)
     f2        GPU job: the bursts benchmark, twice
     freeze    write gate.toml, objectives.toml and the OBJECTIVE.md baseline section; print the numbers
@@ -129,6 +130,21 @@ def require_finite(**values: object) -> None:
             sys.exit(f"[freeze] {name} is not a finite number ({v!r}): rerun the stage that produced it")
 
 
+def tree_hash(base: Path, skip: frozenset[str] = frozenset()) -> str:
+    h = hashlib.sha256()
+    for path in sorted(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.name not in skip):
+        h.update(path.relative_to(base).as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+# the freeze rewrites these three; every other task file is an input of the measurements
+TASK_OUTPUTS = frozenset({"gate.toml", "OBJECTIVE.md", "objectives.toml"})
+
+
+def task_hash() -> str:
+    return tree_hash(TASK, TASK_OUTPUTS)
+
+
 def git(*args: str) -> str:
     return sh(["git", *args], cwd=ROOT).stdout.strip()
 
@@ -140,27 +156,25 @@ class Freezer:
 
     # -- artifact freshness -----------------------------------------------------------------------
 
-    def inputs(self) -> dict:
+    def inputs(self, *, full: bool = True) -> dict:
+        """What an artifact depends on. The CPU dry run picks H and sizes the gate, so it keys on the code only."""
         gate = tomllib.loads(GATE.read_text())
-        return {
-            "head": git("rev-parse", "HEAD"),
-            "infosys": gate["infosys_sha256"],
-            "repo": gate["repo_sha256"],
-            "h_minutes": gate["h_minutes"],
-            "passrun": hashlib.sha256(PASSRUN.read_bytes()).hexdigest(),
-        }
+        base = {"head": git("rev-parse", "HEAD"), "infosys": gate["infosys_sha256"], "repo": gate["repo_sha256"]}
+        if not full:
+            return base
+        return {**base, "h_minutes": gate["h_minutes"], "serving": tree_hash(ROOT / "serving"), "task": task_hash()}
 
     def todo(self, stage: str, artifact: Path) -> bool:
         sidecar = Path(f"{artifact}.inputs")
         if stage in self.force or not artifact.exists() or not sidecar.exists():
             return True
-        if json.loads(sidecar.read_text()) != self.inputs():
+        if json.loads(sidecar.read_text()) != self.inputs(full=stage != "cpu-acc"):
             say(f"{artifact.name} was made from other inputs: redoing it")
             return True
         return False
 
-    def stamp(self, artifact: Path) -> None:
-        Path(f"{artifact}.inputs").write_text(json.dumps(self.inputs(), sort_keys=True))
+    def stamp(self, artifact: Path, *, full: bool = True) -> None:
+        Path(f"{artifact}.inputs").write_text(json.dumps(self.inputs(full=full), sort_keys=True))
 
     # -- CPU stages -------------------------------------------------------------------------------
 
@@ -211,7 +225,7 @@ class Freezer:
             say("CPU dry run of the accuracy checker (long)")
             uv_run(str(TASK / "accuracy_checker" / "checker.py"), "--report", "--device", "cpu", "--drain-s", "1800",
                    "--horizons", ",".join(map(str, HORIZONS)), "--json-out", str(out))  # fmt: skip
-            self.stamp(out)
+            self.stamp(out, full=False)
         return json.loads(out.read_text())
 
     def pick_h(self) -> None:
@@ -233,13 +247,20 @@ class Freezer:
 
     # -- GPU stages -------------------------------------------------------------------------------
 
-    def sync(self) -> None:
+    def sync(self, *, data: bool = True) -> None:
         if git("status", "--porcelain", "--", "serving", "infosys"):
             sys.exit("[freeze] serving/ or infosys/ has uncommitted changes: the baseline must be the committed tree")
         host, camp = need_env("NS_GPU_SSH"), need_env("NS_CAMP")
         sh(["rsync", "-a", "--delete", "--exclude", ".git", "--exclude", ".venv", f"{ROOT}/", f"{host}:{camp}/news-signal/"])
-        sh(["rsync", "-a", f"{need_env('NEWS_SIGNAL_DATA')}/", f"{host}:{camp}/news-signal-data/"])
-        say("checkout and store synced to the cluster")
+        if data:
+            sh(["rsync", "-a", f"{need_env('NEWS_SIGNAL_DATA')}/", f"{host}:{camp}/news-signal-data/"])
+        say("checkout" + (" and store" if data else "") + " synced to the cluster")
+
+    def probe(self) -> None:
+        """One short GPU job through the same submit, poll and fetch machinery: the wrapper on the fixture."""
+        self.sync(data=False)
+        log = self.job("probe", "$PY scripts/wrapper_probe.py\n", "PROBE_DONE", "00:10:00")
+        print("\n".join(line for line in log.splitlines() if line.startswith(("WRAPPED", "PLAIN", "UMOUNT", "NESTED", "LAT", "HIDDEN"))))
 
     def state(self, job_id: str) -> str | None:
         out = ssh(f"sacct -n -P -X -o State -j {job_id}", tries=1)
@@ -262,7 +283,7 @@ class Freezer:
                 f"cd $CAMP/news-signal\nPY=$CAMP/venv/bin/python\nT=.vibesys/tasks/news-signal\n{body}echo {done}\n"
             )
             path = f"{camp}/jobs/ns-{name}.sh"
-            if ssh(f"cat > {path} && chmod +x {path}", input=script) is None:
+            if ssh(f"mkdir -p {camp}/jobs {camp}/logs && cat > {path} && chmod +x {path}", input=script) is None:
                 sys.exit("[freeze] could not write the job script on the cluster")
             reply = ssh(
                 f"{need_env('NS_SBATCH')} -p {need_env('NS_PARTITION')} -N 1 -t {limit} -J ns-{name} "
@@ -360,6 +381,9 @@ class Freezer:
         floor, noise = derive(ic, se, p1, p2)
         bursts_ic = (b1 + b2) / 2
         head = git("rev-parse", "--short", "HEAD")
+        other = [ln for ln in git("status", "--porcelain", "--", ".vibesys").splitlines()
+                 if Path(ln[3:]).name not in TASK_OUTPUTS | {"passrun.py"}]
+        dirty_note = f"; uncommitted task files: {len(other)}" if other else ""
         for key, val in (("frozen", "true"), ("ic", repr(ic)), ("ic_se", repr(se)), ("ic_floor", repr(floor)),
                          ("bursts_ic", repr(bursts_ic)), ("validation_stories", str(s["stories"])),
                          ("scored_pairs", str(s["scored_pairs"])), ("p99_ms", f"[{p1!r}, {p2!r}]"),
@@ -378,7 +402,8 @@ class Freezer:
         section = (
             "## Baseline\n\n"
             f"Unmodified `serving/` (plain FinBERT, one headline per call) at commit `{head}` on 1x MI210, "
-            f"validation split, H = {tomllib.loads(GATE.read_text())['h_reason']}.\n\n"
+            f"validation split, H = {tomllib.loads(GATE.read_text())['h_reason']}. "
+            f"`serving/` tree {tree_hash(ROOT / 'serving')[:12]}, task files {task_hash()[:12]}{dirty_note}.\n\n"
             f"- Accuracy: IC {ic:.4f} (se {se:.4f}) on {s['stories']} stories, {s['scored_pairs']} scored pairs; "
             f"gate floor `ic_floor` = {floor}.\n"
             f"- Bursts: IC {bursts_ic:.4f} (mean of two runs); p99 latency {p1:.1f} ms and {p2:.1f} ms "
@@ -401,11 +426,11 @@ def main() -> None:
     runs = Path(os.environ.get("NS_RUNS", Path.home() / "ns-runs"))
     f = Freezer(runs, set(filter(None, a.force.split(","))))
     steps = {"manifest": f.manifest, "pin": f.pin, "budget": f.budget, "cpu-acc": f.cpu_acc, "h": f.pick_h,
-             "sizing": f.sizing, "sync": f.sync, "f1": f.f1, "f2": f.f2, "freeze": f.freeze}  # fmt: skip
+             "sizing": f.sizing, "sync": f.sync, "probe": f.probe, "f1": f.f1, "f2": f.f2, "freeze": f.freeze}  # fmt: skip
     unknown = set(a.stages.split(",")) - steps.keys()
     if unknown:
         sys.exit(f"[freeze] unknown stage {sorted(unknown)[0]}")
-    for stage in STAGES:
+    for stage in [*STAGES, "probe"]:
         if stage in a.stages.split(","):
             say(f"stage {stage}")
             steps[stage]()

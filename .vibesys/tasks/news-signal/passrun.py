@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -239,7 +240,8 @@ def _tail(path: Path, lines: int = _LOG_TAIL_LINES) -> str:
 def _serving_preexec() -> None:
     """Runs in the serving child before exec: lower priority, and die with the harness (no orphan on the GPU)."""
     os.nice(SERVING_NICE)
-    _libc().prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    if sys.platform.startswith("linux"):
+        _libc().prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
 
 
 def _libc():
@@ -248,30 +250,73 @@ def _libc():
     return ctypes.CDLL(None, use_errno=True)
 
 
-def hidden(cmd: list[str], data_dir: Path | None) -> list[str]:
-    """Run `cmd` in a user+mount namespace with an empty tmpfs over the scoring data directory.
+_SETPRIV = ["setpriv", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs"]
+_ENV_DIR_KEY = re.compile(r"(CACHE|_HOME|_DIR|_PATH_DB)$")
+_SCRATCH_ENV = (
+    "TMPDIR=$S XDG_CACHE_HOME=$S/cache TRITON_CACHE_DIR=$S/triton TORCHINDUCTOR_CACHE_DIR=$S/inductor "
+    "MIOPEN_USER_DB_PATH=$S/miopen MIOPEN_CUSTOM_CACHE_DIR=$S/miopen PYTHONPYCACHEPREFIX=$S/pyc"
+)
 
-    Exits HIDE_FAILED_RC if the mount fails; there is no fallback. The path is an argument, not environment.
+
+def protected_paths(root: Path, work_dir: Path, env: dict[str, str]) -> list[Path]:
+    """Directories the serving process must not be able to change: /tmp, $HOME, the checkout, the work dir
+    (prepared outputs), HF_HOME and every cache or home directory named in the environment."""
+    found = [Path("/tmp"), root, work_dir]
+    for key in ("HOME", "HF_HOME", "HF_HUB_CACHE", "TORCH_HOME"):
+        if env.get(key):
+            found.append(Path(env[key]))
+    for key, value in env.items():
+        if _ENV_DIR_KEY.search(key) and value.startswith("/"):
+            found.append(Path(value))
+    real = sorted({p.resolve() for p in found if p.is_dir() and p.resolve() != Path("/")})
+    return [p for p in real if not any(q != p and p.is_relative_to(q) for q in real)]  # drop nested ones
+
+
+def hidden(cmd: list[str], data_dir: Path | None, protect: list[Path] | None = None) -> list[str]:
+    """Run `cmd` in an unprivileged user + mount namespace and drop every capability before exec.
+
+    - An empty tmpfs hides the scoring data directory.
+    - With `protect` (the serving phase): those directories become read-only binds, /var/tmp and /dev/shm are
+      fresh tmpfs, and TMPDIR and the torch, triton, miopen and XDG caches point at a scratch tmpfs, so nothing
+      the process writes survives the attempt.
+    - Capabilities and the bounding set are then dropped with no-new-privs, so the mounts cannot be undone and a
+      nested namespace gains nothing.
+    Any mount or setpriv failure exits non-zero; there is no fallback. Paths are arguments, not environment.
     """
     if data_dir is None:
         return cmd
-    script = f'mount -t tmpfs tmpfs "$1" || exit {HIDE_FAILED_RC}; shift; exec "$@"'
-    return [*_UNSHARE, "sh", "-c", script, "sh", str(data_dir), *cmd]
+    iso = protect is not None
+    lines = [f'd="$1"; iso="$2"; n="$3"; shift 3', f'mount -t tmpfs tmpfs "$d" || exit {HIDE_FAILED_RC}']
+    lines += [
+        'if [ "$iso" = 1 ]; then',
+        f'  shm=$(readlink -f /dev/shm); mount -t tmpfs tmpfs "$shm" || exit {HIDE_FAILED_RC}',
+        f'  mount -t tmpfs tmpfs /var/tmp || exit {HIDE_FAILED_RC}',
+        '  while [ "$n" -gt 0 ]; do p="$1"; shift; n=$((n - 1))',
+        f'    mount --rbind "$p" "$p" && mount -o remount,bind,ro "$p" || exit {HIDE_FAILED_RC}',
+        "  done",
+        '  S="$shm/ns"; mkdir -p "$S/cache" "$S/triton" "$S/inductor" "$S/miopen" "$S/pyc"',
+        f"  export {_SCRATCH_ENV}",
+        "fi",
+        f'exec {" ".join(_SETPRIV)} "$@"',
+    ]
+    prot = [str(p) for p in protect or []]
+    return [*_UNSHARE, "sh", "-c", "\n".join(lines), "sh", str(data_dir), "1" if iso else "0", str(len(prot)),
+            *prot, *cmd]
 
 
-def _check_can_hide(data_dir: Path, visible: list[Path]) -> None:
-    """Refuse the pass unless the data dir can be hidden and nothing the candidate needs sits inside it."""
+def _check_can_hide(data_dir: Path, protect: list[Path]) -> None:
+    """Refuse the pass unless the full wrapper can be set up and nothing the candidate needs sits inside the data."""
     real = data_dir.resolve()
-    for path in visible:
+    for path in protect:
         if path.resolve().is_relative_to(real):
             raise PassError("the repo, work files or model cache lie inside the scoring data directory")
     try:
-        r = subprocess.run(hidden(["true"], data_dir), capture_output=True, timeout=60)
+        r = subprocess.run(hidden(["true"], data_dir, protect), capture_output=True, timeout=60)
         ok = r.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         ok = False
     if not ok:
-        raise PassError("the scoring data cannot be hidden from the candidate (unshare or tmpfs mount failed); "
+        raise PassError("the scoring data cannot be hidden from the candidate (unshare, mount or setpriv failed); "
                         "the pass is refused")
 
 
@@ -435,6 +480,7 @@ def run_pass(
     root: Path = ROOT,
     data_dir: Path | None = None,
     drain_s: float | None = None,
+    force_hide: bool = False,
 ) -> PassResult:
     gate = load_gate()
     _trust_infosys(root, gate)
@@ -472,19 +518,19 @@ def run_pass(
                      warmup_rate_hz=settings.warmup_hz)
 
     env = _sanitized_env()
-    hide = None if mode is Mode.SMOKE else data_dir
+    hide = None if mode is Mode.SMOKE and not force_hide else data_dir
     with tempfile.TemporaryDirectory(prefix="ns-pass-") as tmp:
         tmp_dir = Path(tmp)
+        protect = protected_paths(root, tmp_dir, env) if hide is not None else None
         if hide is not None:
-            hf = os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE")
-            _check_can_hide(hide, [root, tmp_dir, *([Path(hf)] if hf else [])])
+            _check_can_hide(hide, protect)
         train_file, prepared = tmp_dir / "train.jsonl.gz", tmp_dir / "prepared"
         _write_train_file(train_file, train, train_bars, gate["h_minutes"])
         _run_prepare(root, train_file, prepared, device, env, tmp_dir / "prepare.log", hide)
 
         def make_cmd(url: str) -> list[str]:
             return hidden([sys.executable, "-m", "serving", "--newsd", url, "--model", model, "--device", device,
-                           "--prepared", str(prepared)], hide)
+                           "--prepared", str(prepared)], hide, protect)
 
         def attempt() -> PassLog:
             return asyncio.run(

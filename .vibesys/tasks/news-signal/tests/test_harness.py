@@ -332,7 +332,7 @@ def test_checker_reports_bad_horizons_without_running(capsys):
 # -- failure paths of the pass runner -------------------------------------------------------------------
 
 
-def _fast_ready(monkeypatch, seconds=1.0):
+def _fast_ready(monkeypatch, seconds=10.0):  # a hang guard: the tests end at this timeout, whatever the host's speed
     smoke = passrun.SETTINGS[Mode.SMOKE]
     monkeypatch.setitem(passrun.SETTINGS, Mode.SMOKE, dataclasses.replace(smoke, ready_timeout_s=seconds))
 
@@ -575,24 +575,112 @@ _PROBE = (
 
 
 def test_candidate_cannot_see_the_scoring_data_but_keeps_what_it_needs(repo, store, tmp_path):
-    prep_dump, serve_dump = tmp_path / "prep.json", tmp_path / "serve.json"
+    prep_dump = tmp_path / "prep.json"
     train_read = "i = sys.argv.index('--train') + 1\nout['train_bytes'] = os.path.getsize(sys.argv[i])\n"
     (repo / "serving" / "prepare.py").write_text(
         _PROBE.format(data=str(store), extra=train_read, dump=str(prep_dump))
         + "os.makedirs(sys.argv[sys.argv.index('--out') + 1], exist_ok=True)\n"
     )
-    (repo / "serving" / "__main__.py").write_text(
-        _PROBE.format(data=str(store), extra="out['tree'] = os.path.isfile('serving/model.py')\n", dump=str(serve_dump))
-    )
-    with pytest.raises(PassError):  # the probe exits 0 without calling /ready
+    # serving's filesystem is read-only, so it reports through its exit code and the log tail
+    extra = "out['tree'] = os.path.isfile('serving/model.py')\nprint(json.dumps(out)); sys.exit(3)\n"
+    (repo / "serving" / "__main__.py").write_text(_PROBE.format(data=str(store), extra=extra, dump="/dev/null"))
+    with pytest.raises(PassError, match="exited with code 3") as e:
         passrun.run_pass(Mode.ACCURACY, "validation", root=repo, data_dir=store, device="cpu")
-    for dump in (prep_dump, serve_dump):
-        seen = json.loads(dump.read_text())
+    serve = json.loads(e.value.message.split("pass ended: ", 1)[1])
+    for seen in (json.loads(prep_dump.read_text()), serve):
         assert seen["listdir"] == [] and seen["open"] == "denied"  # the data dir is an empty tmpfs
         assert seen["hf"] == "cache"
     assert json.loads(prep_dump.read_text())["train_bytes"] > 0  # the train export is readable
-    assert json.loads(serve_dump.read_text())["tree"] is True  # so is the serving tree
+    assert serve["tree"] is True  # so is the serving tree
     assert (store / "stories-validation.jsonl.gz").is_file()  # the mount was private to the child
+
+
+def _wrapper(tmp_path, code, protect=()):
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "secret.txt").write_text("validation headline")
+    cmd = passrun.hidden([sys.executable, "-c", code], data, list(protect))
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=60), data
+
+
+def test_candidate_cannot_unmount_or_reveal_the_hidden_data(tmp_path):
+    code = (
+        "import ctypes, os, subprocess\n"
+        f"d = {str(tmp_path / 'data')!r}\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "print('umount', libc.umount2(d.encode(), 0), ctypes.get_errno(), os.listdir(d))\n"
+        "r = subprocess.run(['unshare', '-Urm', 'sh', '-c', 'umount ' + d + '; ls ' + d], capture_output=True, text=True)\n"
+        "print('nested', r.returncode != 0 or r.stdout.strip() == '', 'secret.txt' in r.stdout)\n"
+        "st = dict(l.split(':\\t') for l in open('/proc/self/status') if l.startswith(('CapEff', 'NoNewPrivs')))\n"
+        "print('capeff', int(st['CapEff'], 16), 'nnp', st['NoNewPrivs'].strip())\n"
+    )
+    (tmp_path / "w").mkdir()
+    r, data = _wrapper(tmp_path, code, [tmp_path / "w"])
+    assert r.returncode == 0, r.stderr
+    assert "umount -1 1 []" in r.stdout  # EPERM, and the directory is still empty
+    assert "nested True False" in r.stdout  # a nested namespace gains nothing
+    assert "capeff 0 nnp 1" in r.stdout  # no capabilities, no new privileges
+    assert (data / "secret.txt").is_file()  # outside the namespace nothing changed
+
+
+def test_writes_do_not_survive_the_attempt(tmp_path, monkeypatch):
+    home, hf, work, repo_dir = (tmp_path / n for n in ("home", "hf", "work", "checkout"))
+    for d in (home, hf, work, repo_dir):
+        d.mkdir()
+    token = f"memo-{os.getpid()}-{time.monotonic_ns()}"  # a headline-keyed memo file, as an agent would write
+    targets = {"home": home, "hf": hf, "work": work, "repo": repo_dir, "tmp": Path("/tmp"),
+               "vartmp": Path("/var/tmp"), "shm": Path("/dev/shm")}  # fmt: skip
+    code = (
+        "import json, os\n"
+        f"targets = {{k: v for k, v in {({k: str(v) for k, v in targets.items()})!r}.items()}}\n"
+        "out = {}\n"
+        "for k, p in targets.items():\n"
+        f"    try:\n        open(os.path.join(p, {token!r}), 'w').write('x'); out[k] = 'written'\n"
+        "    except OSError as e:\n        out[k] = e.errno\n"
+        "tmp = os.environ['TMPDIR']\n"
+        "open(os.path.join(tmp, 'scratch'), 'w').write('x')\n"
+        "out['scratch_env'] = [tmp.startswith('/dev/shm'), os.environ['XDG_CACHE_HOME'].startswith(tmp)]\n"
+        "print(json.dumps(out))\n"
+    )
+    protect = passrun.protected_paths(repo_dir, work, {"HOME": str(home), "HF_HOME": str(hf)})
+    assert Path("/tmp") in protect  # the test dirs live under /tmp, so one bind covers them
+    for d in (home, hf, work, repo_dir):
+        assert any(d.resolve().is_relative_to(p) for p in protect)
+    for _ in range(2):  # the second attempt must find nothing from the first
+        r, _ = _wrapper(tmp_path, code, protect)
+        assert r.returncode == 0, r.stderr
+        seen = json.loads(r.stdout.strip().splitlines()[-1])
+        assert all(seen[k] == 30 for k in ("home", "hf", "work", "repo", "tmp"))  # EROFS
+        assert seen["vartmp"] == "written" and seen["shm"] == "written" and seen["scratch_env"] == [True, True]
+        for d in (*targets.values(), tmp_path / "data"):
+            assert not (d / token).exists(), d  # nothing reached the host
+
+
+def test_protected_paths_cover_env_named_caches_and_drop_nested():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:  # outside /tmp, which would cover everything
+        cache = Path(tmp) / "c"
+        (cache / "inner").mkdir(parents=True)
+        paths = passrun.protected_paths(Path(tmp) / "r", Path(tmp) / "w",
+                                        {"FOO_CACHE": str(cache), "BAR_HOME": str(cache / "inner")})
+        assert cache.resolve() in paths and (cache / "inner").resolve() not in paths
+
+
+def test_missing_setpriv_refuses_a_real_data_pass(repo, store, monkeypatch):
+    monkeypatch.setattr(passrun, "_SETPRIV", ["no-such-setpriv"])
+    with pytest.raises(PassError, match="cannot be hidden"):
+        passrun.run_pass(Mode.ACCURACY, "validation", root=repo, data_dir=store, device="cpu")
+
+
+def test_checker_pass_and_fail_output_with_a_frozen_gate(capsys, monkeypatch):
+    gate = {**_gate(), "h_minutes": 5}
+    monkeypatch.setattr(checker, "load_gate", lambda: gate)
+    for score, code, text in ((_score(), 0, "PASS"), (_score(ic=0.0), 1, "FAIL: ic 0.0000 is below the floor")):
+        result = passrun.PassResult(None, None, None, score)
+        monkeypatch.setattr(checker, "run_pass", lambda *a, _r=result, **k: _r)
+        assert checker.main([]) == code
+        assert text in capsys.readouterr().out
 
 
 def test_unshare_failure_refuses_a_real_data_pass_without_fallback(repo, store, monkeypatch):
@@ -686,3 +774,30 @@ def test_task_timeouts_cover_two_passes_and_prepare():
     )
     assert cfg["accuracy"]["timeout_seconds"] >= worst_acc
     assert cfg["benchmark"]["timeout_seconds"] >= worst_bench
+
+
+def test_cpu_acc_artifact_survives_h_and_sizing_but_not_code_changes(freezer):
+    module, fz, runs, repo = freezer
+    art = runs / "cpu-acc.json"
+    art.write_text("{}")
+    fz.stamp(art, full=False)
+    assert not fz.todo("cpu-acc", art)
+    task = repo / ".vibesys" / "tasks" / "news-signal"
+    module.set_toml(task / "gate.toml", "h_minutes", "30")  # what the h stage does
+    (task / "passrun.py").write_text((task / "passrun.py").read_text() + "\n# sizing\n")
+    assert not fz.todo("cpu-acc", art)
+    module.set_toml(task / "gate.toml", "infosys_sha256", '"' + "1" * 64 + '"')
+    assert fz.todo("cpu-acc", art)
+
+
+def test_baseline_artifacts_are_stale_after_a_serving_or_task_file_edit(freezer):
+    module, fz, runs, repo = freezer
+    art = runs / "f1.json"
+    art.write_text("{}")
+    fz.stamp(art)
+    assert not fz.todo("f1", art)
+    (repo / "serving" / "model.py").write_text("# edited\n")
+    assert fz.todo("f1", art)
+    fz.stamp(art)
+    (repo / ".vibesys" / "tasks" / "news-signal" / "benchmark" / "run.py").write_text("# edited\n")
+    assert fz.todo("f1", art)

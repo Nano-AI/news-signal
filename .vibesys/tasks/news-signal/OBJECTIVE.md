@@ -27,11 +27,20 @@ Face FinBERT classifier, one headline per call. Everything the service may rely 
   data directory, nor `/proc` entries of its parent), may not infer future stories from ids or order, and may
   not signal a story before it has received it. `newsd` refuses a signal for a story before its first
   scheduled availability. On every real-data pass
-  the harness runs both `serving.prepare` and the service in an unprivileged user and mount namespace with an
-  empty tmpfs over the scoring data directory, so that directory is empty from inside and the pass is refused
-  (no fallback) if the namespace cannot be set up. The train export, the model cache and the repo stay visible.
-  The parent is not dumpable and the child's environment is stripped of `NEWS_SIGNAL_*`. The fixture check runs
-  without the namespace.
+  the harness runs both `serving.prepare` and the service in an unprivileged user and mount namespace, then drops
+  every capability and sets no-new-privs before exec (so the mounts cannot be undone and a nested namespace gains
+  nothing). An empty tmpfs hides the scoring data directory. The pass is refused, with no fallback, if the
+  namespace, a mount or the capability drop cannot be set up. The parent is not dumpable and the child's
+  environment is stripped of `NEWS_SIGNAL_*`. The fixture check runs without the namespace.
+- Nothing the service writes during the serving phase survives the attempt (prepare outputs do persist: it
+  never sees stories). Enforced, for the service only: `/tmp`, the repo checkout, the prepare work directory
+  (including `prepared/`), `$HOME` (so `~/.cache`, `~/.triton`), `HF_HOME`, `HF_HUB_CACHE`, `TORCH_HOME` and every
+  directory named by an environment variable ending in `CACHE`, `_HOME`, `_DIR` or `_PATH_DB` are read-only;
+  `/var/tmp` and `/dev/shm` are fresh tmpfs; `TMPDIR`, `XDG_CACHE_HOME`, `TRITON_CACHE_DIR`,
+  `TORCHINDUCTOR_CACHE_DIR`, `MIOPEN_USER_DB_PATH` and `PYTHONPYCACHEPREFIX` point at a scratch tmpfs that is
+  discarded. Prepare may warm caches into its work directory and the service reads them there. The service must
+  not persist or transmit anything derived from the stories (memoised outputs, logs of headlines, a network
+  call) by any path the wrapper does not cover either; the network is not restricted by the harness.
 - The service must behave the same in every pass. Detecting which pass it is in (by story count, spacing, rate,
   the parent's command line, or anything else) and changing its model or output accordingly is forbidden.
 - Log output on a failed pass reaches you truncated (20 lines of 200 characters); do not use it to move data.
