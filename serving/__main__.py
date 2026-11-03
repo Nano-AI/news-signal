@@ -15,4 +15,5 @@ def main() -> None:
     asyncio.run(run(a.newsd, Classifier(a.model, a.device).predict))
 
 
-main()
+if __name__ == "__main__":
+    main()

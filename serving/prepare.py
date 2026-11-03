@@ -12,4 +12,5 @@ def main() -> None:
     Path(p.parse_args().out).mkdir(parents=True, exist_ok=True)
 
 
-main()
+if __name__ == "__main__":
+    main()

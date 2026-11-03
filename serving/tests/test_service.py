@@ -87,3 +87,57 @@ def test_service_end_to_end():
     pairs = sorted((s["story_id"], s["ticker"]) for s in fake.signals)
     assert pairs == [("s1", "AAA"), ("s1", "BBB"), ("s2", "CCC"), ("s3", "DDD")]
     assert {s["story_id"]: (s["direction"], s["confidence"]) for s in fake.signals}["s2"] == (-1, 0.8)
+
+
+# ---- failure paths ----------------------------------------------------------------------------
+import pytest  # noqa: E402
+
+
+class Variant(FakeNewsd):
+    def __init__(self, mode):
+        super().__init__()
+        self.mode = mode
+
+    async def ws(self, req):
+        if self.mode != "ws_drop":
+            return await super().ws(req)
+        ws = web.WebSocketResponse()
+        await ws.prepare(req)
+        self.ws_open += 1
+        if self.ws_open == 2:
+            self.both_ws.set()
+        await self.ready.wait()
+        await ws.close()  # no end frame
+        return ws
+
+    async def on_signals(self, req):
+        if self.mode in ("409", "500"):
+            return web.json_response({"error": "x"}, status=int(self.mode))
+        return await super().on_signals(req)
+
+
+async def _failing(mode, classify):
+    fake = Variant(mode)
+    runner = web.AppRunner(fake.app, shutdown_timeout=0.1)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        await asyncio.wait_for(run(f"http://127.0.0.1:{port}", classify), timeout=10)
+    finally:
+        await runner.cleanup()
+
+
+def _boom(h):
+    raise KeyError("boom")
+
+
+@pytest.mark.parametrize("mode,exc", [("500", RuntimeError), ("ws_drop", RuntimeError), ("ok", KeyError)])
+def test_failures_raise(mode, exc):
+    with pytest.raises(exc):
+        asyncio.run(_failing(mode, _boom if mode == "ok" else (lambda h: FAKE[h])))
+
+
+def test_409_stops_cleanly():
+    asyncio.run(_failing("409", lambda h: FAKE[h]))

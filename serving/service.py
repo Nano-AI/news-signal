@@ -1,6 +1,7 @@
 """Baseline service: subscribe to every feed, classify each new story, post one signal per ticker."""
 
 import asyncio
+import sys
 from collections.abc import Callable
 
 import aiohttp
@@ -24,9 +25,10 @@ async def _ws_feed(session, base: str, feed: dict, queue: asyncio.Queue, opened:
         async for frame in ws:
             msg = frame.json()
             if msg["type"] == "end":
-                break
+                await queue.put(None)
+                return
             await queue.put(parse_story(msg))
-    await queue.put(None)
+    raise RuntimeError(f"ws feed {feed['name']} closed without end")
 
 
 async def _poll_feed(session, base: str, feed: dict, queue: asyncio.Queue):
@@ -60,7 +62,10 @@ async def _worker(session, base: str, queue: asyncio.Queue, n_feeds: int, classi
         for ticker in story["tickers"]:
             sig = build_signal(story["story_id"], ticker, direction, confidence)
             async with session.post(base + "/signals", json={"signals": [sig]}) as r:
-                r.raise_for_status()
+                if r.status == 409:  # run finished: nothing left to score
+                    return
+                if r.status != 200:
+                    raise RuntimeError(f"POST /signals -> {r.status}: {await r.text()}")
 
 
 async def run(newsd_url: str, classify: Callable[[str], tuple[int, float]]) -> None:
@@ -79,9 +84,9 @@ async def run(newsd_url: str, classify: Callable[[str], tuple[int, float]]) -> N
             else:
                 tasks.append(asyncio.create_task(_poll_feed(session, base, feed, queue)))
         tasks.append(asyncio.create_task(_worker(session, base, queue, len(feeds), classify)))
+        waiter = asyncio.gather(*(ev.wait() for ev in opened))
         try:
             # a feed task dying before its socket opens must not hang the wait
-            waiter = asyncio.gather(*(ev.wait() for ev in opened))
             done, _ = await asyncio.wait([waiter, *tasks], return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 if t is not waiter:
@@ -89,7 +94,16 @@ async def run(newsd_url: str, classify: Callable[[str], tuple[int, float]]) -> N
             await waiter
             async with session.post(base + "/ready") as r:
                 r.raise_for_status()
-            await asyncio.gather(*tasks)
+            worker, pending = tasks[-1], set(tasks)
+            while worker in pending:  # worker ends at all feeds ended, or on 409
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    t.result()
+        except BaseException as e:
+            print(f"serving: {e!r}", file=sys.stderr)
+            raise
         finally:
+            waiter.cancel()
             for t in tasks:
                 t.cancel()
+            await asyncio.gather(waiter, *tasks, return_exceptions=True)
