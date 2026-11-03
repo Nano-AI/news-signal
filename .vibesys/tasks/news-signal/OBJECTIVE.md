@@ -53,10 +53,14 @@ Two commands, both run from the repo root on the MI210 node.
 split, up to 180 s of compressed replay (gaps capped at 2 s), on six feeds with different delays, drops and
 duplicates. Latency of a pair is the time from `newsd` handing the story to the service to the first accepted
 signal for the pair. Reported: `p99_latency_ms` and `p50_latency_ms` (the objectives), `p90_latency_ms`,
-`throughput_signals_per_s`, `missed`, `duplicates`, `invalid` and `newsd_send_lag_p99_ms`. A pass with any
+`throughput_signals_per_s`, `missed`, `duplicates`, `invalid` and `newsd_send_lag_p50_ms`, `_p90_ms`, `_p99_ms` and `_max_ms`. A pass with any
 missed pair beyond 0.1 %, duplicate beyond 0.1 %, or any invalid signal produces an error, not a result. So does
-a pass in which `newsd` itself fell behind (send lag p99 over 5 ms) twice: the harness reruns an invalid pass once
+a pass in which `newsd` itself fell behind (send lag p90 over 5 ms or p99 over 50 ms) twice: the harness reruns an invalid pass once
 and uses the rerun, reporting `reruns` and the first pass's send lag.
+Systematic server lateness, which is what a CPU-starving candidate causes, moves p90, while rare node stalls only
+move the tail (an idle GPU node showed intermittent 15-20 ms stalls with p90 under 1.5 ms). A stall bunches late
+stories, which makes the candidate's job harder, not easier, and latency is measured from the enqueue instant, so
+stalls never flatter the candidate.
 The pass also scores prediction quality: it fails if the service emits fewer than two distinct directions, or if
 its IC is below the baseline bursts IC minus 3 standard errors of the pass. The service process runs at nice 10
 so its CPU threads cannot starve `newsd`'s scheduler.

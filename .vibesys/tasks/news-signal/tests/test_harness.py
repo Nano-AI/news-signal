@@ -48,7 +48,7 @@ def _score(**kw) -> PassScore:
     base = dict(
         stories=100, pairs=1000, signaled=1000, missed=0, duplicates=0, invalid=0,
         latency_ms={"p50": 5.0, "p90": 9.0, "p99": 20.0, "max": 30.0}, throughput_per_s=50.0,
-        scored_pairs=800, ic=0.05, ic_se=0.01, hit_rate=0.52, send_lag_p99_ms=0.4,
+        scored_pairs=800, ic=0.05, ic_se=0.01, hit_rate=0.52, send_lag_ms={"p50": 0.2, "p90": 0.3, "p99": 0.4, "max": 0.9},
     )  # fmt: skip
     return PassScore(**{**base, **kw})
 
@@ -206,14 +206,14 @@ def test_cpu_check_passes():
 def test_gate_passes_exactly_when_all_checks_hold(ic, missed, dup, invalid, valid, frozen):
     score = _score(
         ic=ic, missed=missed, duplicates=dup, invalid=invalid, valid=valid,
-        invalid_reason=None if valid else "send lag p99 9.0 ms exceeds 5.0 ms",
+        invalid_reason=None if valid else "send lag p90 9.0 ms exceeds 5.0 ms",
     )  # fmt: skip
     expected = frozen and valid and ic is not None and ic >= 0.03 and missed <= 1 and dup <= 1 and invalid == 0
     assert (checker.evaluate_gate(score, _gate(frozen=frozen)) is None) == expected
 
 
 def test_gate_names_the_invalid_pass():
-    msg = checker.evaluate_gate(_score(valid=False, invalid_reason="send lag p99 9.0 ms exceeds 5.0 ms"), _gate())
+    msg = checker.evaluate_gate(_score(valid=False, invalid_reason="send lag p90 9.0 ms exceeds 5.0 ms"), _gate())
     assert msg is not None and "send lag" in msg
 
 
@@ -274,7 +274,7 @@ def test_vs_output_records(tmp_path):
     assert ok["kind"] == "result" and ok["values"]["p99_latency_ms"] == 20.0
     for bad in (
         _score(missed=5), _score(duplicates=5), _score(invalid=1),
-        _score(valid=False, invalid_reason="send lag p99 9.0 ms exceeds 5.0 ms"),
+        _score(valid=False, invalid_reason="send lag p90 9.0 ms exceeds 5.0 ms"),
         _score(latency_ms={"p50": None, "p90": None, "p99": None, "max": None}, missed=1000, signaled=0),
     ):  # fmt: skip
         err = _check_stream(_write(tmp_path, bench.records_for(bad, gate, DIRS)))
@@ -416,13 +416,15 @@ def freezer(repo, tmp_path):
     return module, module.Freezer(runs, set()), runs, repo
 
 
-def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03):
+def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0):
     score = {"stories": 1000, "scored_pairs": 700, "ic": ic, "ic_se": 0.01, "missed": 0 if clean else 3,
              "duplicates": 0, "invalid": 0, "valid": True}  # fmt: skip
     (runs / "f1.json").write_text(json.dumps({"score": score}))
     fz.stamp(runs / "f1.json")
     for i, p99 in enumerate((100.0, 104.0), start=1):
-        values = {"p99_latency_ms": p99, "p50_latency_ms": 10.0, "stories": 300, "ic": bursts_ic}
+        values = {"p99_latency_ms": p99, "p50_latency_ms": 10.0, "stories": 300, "ic": bursts_ic,
+                  "newsd_send_lag_p50_ms": 0.7, "newsd_send_lag_p90_ms": lag_p90, "newsd_send_lag_p99_ms": 20.0,
+                  "newsd_send_lag_max_ms": 25.0}  # fmt: skip
         rec = {"kind": "result", "label": "", "values": values}
         (runs / f"bench-{i}.jsonl").write_text(json.dumps(bench.HELLO) + "\n" + json.dumps(rec) + "\n")
         fz.stamp(runs / f"bench-{i}.jsonl")
@@ -715,7 +717,7 @@ def test_data_dir_must_not_contain_what_the_candidate_needs(tmp_path):
 # -- an invalid pass is rerun once ---------------------------------------------------------------------
 
 
-LAG = "send lag p99 9.0 ms exceeds 5.0 ms"
+LAG = "send lag p90 9.0 ms exceeds 5.0 ms"
 
 
 def _attempts(*scores):
@@ -731,13 +733,13 @@ def _attempts(*scores):
 
 def test_invalid_pass_is_rerun_once_and_the_rerun_is_used(tmp_path):
     attempt, calls = _attempts("a", "b")
-    scores = {"a": _score(valid=False, invalid_reason=LAG, send_lag_p99_ms=9.0), "b": _score()}
+    scores = {"a": _score(valid=False, invalid_reason=LAG, send_lag_ms={"p50": 1.0, "p90": 9.0, "p99": 9.0, "max": 9.0}), "b": _score()}
     log, score, first = passrun.run_with_retry(attempt, scores.__getitem__)
     assert (log, len(calls), score.valid, first.invalid_reason) == ("b", 2, True, LAG)
     gate = _gate()
     rec = _check_stream(_write(tmp_path, bench.records_for(score, gate, DIRS, first)))
     assert rec["kind"] == "result" and rec["values"]["reruns"] == 1
-    assert rec["values"]["first_pass_send_lag_p99_ms"] == 9.0
+    assert rec["values"]["first_pass_send_lag_p90_ms"] == 9.0
     assert checker.evaluate_gate(score, gate) is None
 
 
@@ -751,7 +753,7 @@ def test_valid_pass_is_not_rerun(tmp_path):
 
 def test_two_invalid_passes_fail_and_name_both_reasons(tmp_path):
     attempt, calls = _attempts("a", "b")
-    second = "send lag p99 7.0 ms exceeds 5.0 ms"
+    second = "send lag p90 7.0 ms exceeds 5.0 ms"
     bad = {"a": _score(valid=False, invalid_reason=LAG), "b": _score(valid=False, invalid_reason=second)}
     _, score, first = passrun.run_with_retry(attempt, bad.__getitem__)
     assert len(calls) == 2 and not score.valid
@@ -801,3 +803,32 @@ def test_baseline_artifacts_are_stale_after_a_serving_or_task_file_edit(freezer)
     fz.stamp(art)
     (repo / ".vibesys" / "tasks" / "news-signal" / "benchmark" / "run.py").write_text("# edited\n")
     assert fz.todo("f1", art)
+
+
+def test_send_lag_fields_are_in_the_benchmark_record(tmp_path):
+    rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS)))
+    assert [rec["values"][f"newsd_send_lag_{k}_ms"] for k in ("p50", "p90", "p99", "max")] == [0.2, 0.3, 0.4, 0.9]
+
+
+def test_send_lag_fields_are_in_the_checker_json(tmp_path):
+    from dataclasses import asdict
+
+    assert set(asdict(_score())["send_lag_ms"]) == {"p50", "p90", "p99", "max"}
+
+
+def test_freeze_rule_matches_the_scorer():
+    import importlib.util
+
+    from infosys import score
+
+    spec = importlib.util.spec_from_file_location("freeze_baseline", ROOT / "scripts" / "freeze_baseline.py")
+    fb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fb)
+    assert fb.SEND_LAG_MAX_MS == {"p90": score.MAX_SEND_LAG_P90_MS, "p99": score.MAX_SEND_LAG_P99_MS}
+
+
+def test_freeze_refuses_a_bench_result_that_breaks_the_send_lag_rule(freezer):
+    _, fz, runs, _ = freezer
+    _artifacts(fz, runs, lag_p90=6.0)
+    with pytest.raises(SystemExit, match="send lag p90 6.0 ms"):
+        fz.freeze()

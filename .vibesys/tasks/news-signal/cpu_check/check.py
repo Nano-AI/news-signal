@@ -25,7 +25,7 @@ def main() -> int:
     lat = score.latency_ms
     print(
         f"stories={score.stories} pairs={score.pairs} missed={score.missed} duplicates={score.duplicates} "
-        f"invalid={score.invalid} p50_ms={lat['p50']} p99_ms={lat['p99']} send_lag_p99_ms={score.send_lag_p99_ms:.2f}"
+        f"invalid={score.invalid} p50_ms={lat['p50']} p99_ms={lat['p99']} send_lag_p90_ms={score.send_lag_ms['p90']:.2f} send_lag_p99_ms={score.send_lag_ms['p99']:.2f}"
     )
     if not score.valid:
         print(f"note: timing not trustworthy on this host: {score.invalid_reason}")

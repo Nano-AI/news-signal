@@ -12,7 +12,10 @@ from infosys.replay import ReplayPlan
 from infosys.store import Bars
 
 MIN_IC_PAIRS = 30
-MAX_SEND_LAG_P99_MS = 5.0  # above this the server fell behind and latencies are not trustworthy
+# A pass is valid iff send lag p90 <= 5 ms and p99 <= 50 ms. Systematic lateness (a starved server) moves p90;
+# rare node stalls only move the tail. Above either bound the latencies are not trustworthy.
+MAX_SEND_LAG_P90_MS = 5.0
+MAX_SEND_LAG_P99_MS = 50.0
 
 
 @dataclass(frozen=True)
@@ -29,7 +32,7 @@ class PassScore:
     ic: float | None
     ic_se: float | None
     hit_rate: float | None
-    send_lag_p99_ms: float
+    send_lag_ms: dict[str, float]  # p50, p90, p99, max of newsd's send lateness; zeros when nothing was sent
     valid: bool = True
     invalid_reason: str | None = None
 
@@ -117,8 +120,13 @@ def score_pass(
         else 0.0
     )
     lag = log.send_lag_ms
-    lag_p99 = float(np.percentile(lag, 99)) if lag else 0.0
-    reason = f"send lag p99 {lag_p99:.1f} ms exceeds {MAX_SEND_LAG_P99_MS} ms" if lag_p99 > MAX_SEND_LAG_P99_MS else None
+    send_lag = {k: v or 0.0 for k, v in _percentiles(lag).items()}
+    failed = [
+        f"send lag {k} {send_lag[k]:.1f} ms exceeds {bound} ms"
+        for k, bound in (("p90", MAX_SEND_LAG_P90_MS), ("p99", MAX_SEND_LAG_P99_MS))
+        if send_lag[k] > bound
+    ]
+    reason = "; ".join(failed) or None
     return PassScore(
         stories=len(plan.measured),
         pairs=pairs,
@@ -132,7 +140,7 @@ def score_pass(
         ic=ic,
         ic_se=ic_se,
         hit_rate=hit_rate,
-        send_lag_p99_ms=lag_p99,
+        send_lag_ms=send_lag,
         valid=reason is None,
         invalid_reason=reason,
     )

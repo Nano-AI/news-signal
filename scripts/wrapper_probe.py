@@ -56,7 +56,7 @@ def main() -> None:
         s = r.score
         print(label, "valid", s.valid, "missed", s.missed, "dup", s.duplicates, "invalid", s.invalid,
               "p50_ms %.1f" % s.latency_ms["p50"], "p99_ms %.1f" % s.latency_ms["p99"],
-              "send_lag_p99_ms %.2f" % s.send_lag_p99_ms, "rerun", r.first_invalid is not None, flush=True)
+              "send_lag_p90_ms %.2f p99_ms %.2f" % (s.send_lag_ms["p90"], s.send_lag_ms["p99"]), "rerun", r.first_invalid is not None, flush=True)
     root = Path(".").resolve()
     data = root / "infosys" / "fixtures" / "tiny"
     env = passrun._sanitized_env()

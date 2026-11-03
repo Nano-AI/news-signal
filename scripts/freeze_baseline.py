@@ -56,6 +56,7 @@ TERMINAL = {
     "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL", "DEADLINE", "PREEMPTED",
 }  # fmt: skip
 POLL_S = 60
+SEND_LAG_MAX_MS = {"p90": 5.0, "p99": 50.0}  # the validity rule; a test pins it to infosys.score
 
 
 def say(msg: str) -> None:
@@ -364,6 +365,11 @@ class Freezer:
             last = json.loads(p.read_text().splitlines()[-1])
             if last["kind"] != "result":
                 sys.exit(f"[freeze] {p.name} is not a result: {str(last.get('message'))[:300]}")
+            lag = {k: last["values"].get(f"newsd_send_lag_{k}_ms") for k in ("p50", "p90", "p99", "max")}
+            require_finite(**{f"send_lag_{k}": v for k, v in lag.items()})
+            over = [f"{k} {lag[k]:.1f} ms > {bound} ms" for k, bound in SEND_LAG_MAX_MS.items() if lag[k] > bound]
+            if over:
+                sys.exit(f"[freeze] {p.name}: invalid pass, send lag {', '.join(over)}")
             if last["values"].get("reruns"):
                 say(f"{p.name}: the first pass was invalid (send lag), the rerun is the result")
             results.append(last["values"])

@@ -27,8 +27,12 @@ HELLO = {
         "duplicates": {"direction": "min"},
         "invalid": {"direction": "min"},
         "stories": {},
+        "newsd_send_lag_p50_ms": {"unit": "ms", "direction": "min", "required": False},
+        "newsd_send_lag_p90_ms": {"unit": "ms", "direction": "min", "required": False},
         "newsd_send_lag_p99_ms": {"unit": "ms", "direction": "min", "required": False},
+        "newsd_send_lag_max_ms": {"unit": "ms", "direction": "min", "required": False},
         "reruns": {"direction": "min", "required": False},
+        "first_pass_send_lag_p90_ms": {"unit": "ms", "required": False},
         "first_pass_send_lag_p99_ms": {"unit": "ms", "required": False},
         "ic": {"direction": "max", "required": False},
         "ic_se": {"required": False},
@@ -98,11 +102,15 @@ def records_for(score, gate: dict, directions: set[int], first_invalid=None) -> 
         "duplicates": score.duplicates,
         "invalid": score.invalid,
         "stories": score.stories,
-        "newsd_send_lag_p99_ms": score.send_lag_p99_ms,
+        "newsd_send_lag_p50_ms": score.send_lag_ms["p50"],
+        "newsd_send_lag_p90_ms": score.send_lag_ms["p90"],
+        "newsd_send_lag_p99_ms": score.send_lag_ms["p99"],
+        "newsd_send_lag_max_ms": score.send_lag_ms["max"],
     }
     if first_invalid is not None:  # the first pass was invalid (newsd fell behind) and the rerun is reported
         values["reruns"] = 1
-        values["first_pass_send_lag_p99_ms"] = first_invalid.send_lag_p99_ms
+        values["first_pass_send_lag_p90_ms"] = first_invalid.send_lag_ms["p90"]
+        values["first_pass_send_lag_p99_ms"] = first_invalid.send_lag_ms["p99"]
     else:
         values["reruns"] = 0
     if score.ic is not None:
@@ -140,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"bursts: stories={v['stories']} p50={v['p50_latency_ms']:.1f}ms p90={v['p90_latency_ms']:.1f}ms "
         f"p99={v['p99_latency_ms']:.1f}ms throughput={v['throughput_signals_per_s']:.1f}/s "
-        f"send_lag_p99={v['newsd_send_lag_p99_ms']:.2f}ms reruns={v['reruns']}"
+        f"send_lag_p90={v['newsd_send_lag_p90_ms']:.2f}ms p99={v['newsd_send_lag_p99_ms']:.2f}ms reruns={v['reruns']}"
     )
     if result.first_invalid is not None:
         print(f"note: first pass was invalid ({result.first_invalid.invalid_reason}); the rerun is reported")
