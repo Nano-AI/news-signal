@@ -80,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
         hs = s if h == gate["h_minutes"] else rescore(result, h)
         per_horizon[h] = {"ic": hs.ic, "ic_se": hs.ic_se, "scored_pairs": hs.scored_pairs}
         print(f"ic@{h}={_fmt(hs.ic)} se={_fmt(hs.ic_se)}")
+    if result.first_invalid is not None:
+        print(f"note: first pass was invalid ({result.first_invalid.invalid_reason}); the rerun is used")
     if not s.valid:
         print(f"note: invalid pass: {s.invalid_reason}")
     if a.json_out:
@@ -88,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "score": asdict(s),
                     "horizons": per_horizon,
+                    "first_pass": asdict(result.first_invalid) if result.first_invalid else None,
                 },
                 indent=2,
             )

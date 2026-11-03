@@ -46,7 +46,7 @@ HORIZONS = (5, 15, 30, 60)
 MS_PER_HEADLINE = 8.51  # FinBERT baseline, median over single-headline calls on the target GPU (install smoke)
 REPLAY_BUDGET_S = 360
 F1_LIMIT = "00:20:00"  # replay (<= 5 min) + backlog + startup; the gate's drain ends early once pairs are in
-F2_LIMIT = "00:10:00"
+F2_LIMIT = "00:20:00"  # two benchmark runs, each may rerun an invalid pass once
 STAGES = ["manifest", "pin", "budget", "cpu-acc", "h", "sizing", "sync", "f1", "f2", "freeze"]
 MAX_PENDING_S = 3 * 3600
 SSH_TRIES = 3
@@ -343,6 +343,8 @@ class Freezer:
             last = json.loads(p.read_text().splitlines()[-1])
             if last["kind"] != "result":
                 sys.exit(f"[freeze] {p.name} is not a result: {str(last.get('message'))[:300]}")
+            if last["values"].get("reruns"):
+                say(f"{p.name}: the first pass was invalid (send lag), the rerun is the result")
             results.append(last["values"])
         return results
 

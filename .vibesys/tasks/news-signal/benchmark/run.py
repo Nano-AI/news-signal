@@ -28,6 +28,8 @@ HELLO = {
         "invalid": {"direction": "min"},
         "stories": {},
         "newsd_send_lag_p99_ms": {"unit": "ms", "direction": "min", "required": False},
+        "reruns": {"direction": "min", "required": False},
+        "first_pass_send_lag_p99_ms": {"unit": "ms", "required": False},
         "ic": {"direction": "max", "required": False},
         "ic_se": {"required": False},
     },
@@ -67,12 +69,14 @@ def quality_failure(score, gate: dict, directions: set[int]) -> str | None:
     return None
 
 
-def records_for(score, gate: dict, directions: set[int]) -> list[dict]:
+def records_for(score, gate: dict, directions: set[int], first_invalid=None) -> list[dict]:
     """HELLO plus one result, or an error naming the first failing check and carrying the p99 reached."""
     lat = score.latency_ms
     partial = _partial_p99(lat["p99"]) if score.valid else None  # an invalid pass's p99 is not trustworthy
     if not score.valid:
-        return [HELLO, error_record(f"invalid pass: {score.invalid_reason}")]
+        first = f"; first pass: {first_invalid.invalid_reason}" if first_invalid else ""
+        return [HELLO, error_record(f"invalid pass after a rerun: {score.invalid_reason}{first}" if first_invalid
+                                    else f"invalid pass: {score.invalid_reason}")]
     for name, count, limit in (
         ("missed", score.missed, gate["max_missed_frac"] * score.pairs),
         ("duplicates", score.duplicates, gate["max_duplicate_frac"] * score.pairs),
@@ -96,6 +100,11 @@ def records_for(score, gate: dict, directions: set[int]) -> list[dict]:
         "stories": score.stories,
         "newsd_send_lag_p99_ms": score.send_lag_p99_ms,
     }
+    if first_invalid is not None:  # the first pass was invalid (newsd fell behind) and the rerun is reported
+        values["reruns"] = 1
+        values["first_pass_send_lag_p99_ms"] = first_invalid.send_lag_p99_ms
+    else:
+        values["reruns"] = 0
     if score.ic is not None:
         values["ic"] = score.ic
     if score.ic_se is not None:
@@ -117,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         gate = load_gate()
         result = run_pass(Mode.BURSTS, a.split, device=a.device)
-        records = records_for(result.score, gate, {sig.direction for sig in result.log.signals})
+        records = records_for(result.score, gate, {sig.direction for sig in result.log.signals}, result.first_invalid)
     except PassError as e:
         records = [HELLO, error_record(e.message, requirement=e.requirement)]
     except Exception as e:  # the stream must exist; the type alone, since messages can carry data text
@@ -131,8 +140,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"bursts: stories={v['stories']} p50={v['p50_latency_ms']:.1f}ms p90={v['p90_latency_ms']:.1f}ms "
         f"p99={v['p99_latency_ms']:.1f}ms throughput={v['throughput_signals_per_s']:.1f}/s "
-        f"send_lag_p99={v['newsd_send_lag_p99_ms']:.2f}ms"
+        f"send_lag_p99={v['newsd_send_lag_p99_ms']:.2f}ms reruns={v['reruns']}"
     )
+    if result.first_invalid is not None:
+        print(f"note: first pass was invalid ({result.first_invalid.invalid_reason}); the rerun is reported")
     return 0
 
 

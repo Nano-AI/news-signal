@@ -544,3 +544,145 @@ def test_freeze_set_toml_edits_only_the_named_section(tmp_path):
 
 
 _FREEZE = _load_freeze()
+
+
+# -- scoring data hidden from the candidate (real-data passes) -------------------------------------------
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    dest = tmp_path / "store"
+    shutil.copytree(ROOT / "infosys" / "fixtures" / "tiny", dest)
+    monkeypatch.setattr(passrun, "MANIFEST_PATH", dest / "manifest.json")
+    hf = tmp_path / "hf"
+    hf.mkdir()
+    (hf / "marker.txt").write_text("cache")
+    monkeypatch.setenv("HF_HOME", str(hf))
+    return dest
+
+
+_PROBE = (
+    "import json, os, sys\n"
+    "data = {data!r}\n"
+    "out = {{}}\n"
+    "out['listdir'] = os.listdir(data)\n"
+    "try:\n    open(os.path.join(data, 'stories-validation.jsonl.gz'), 'rb'); out['open'] = 'readable'\n"
+    "except OSError:\n    out['open'] = 'denied'\n"
+    "out['hf'] = open(os.path.join(os.environ['HF_HOME'], 'marker.txt')).read()\n"
+    "{extra}"
+    "open({dump!r}, 'w').write(json.dumps(out))\n"
+)
+
+
+def test_candidate_cannot_see_the_scoring_data_but_keeps_what_it_needs(repo, store, tmp_path):
+    prep_dump, serve_dump = tmp_path / "prep.json", tmp_path / "serve.json"
+    train_read = "i = sys.argv.index('--train') + 1\nout['train_bytes'] = os.path.getsize(sys.argv[i])\n"
+    (repo / "serving" / "prepare.py").write_text(
+        _PROBE.format(data=str(store), extra=train_read, dump=str(prep_dump))
+        + "os.makedirs(sys.argv[sys.argv.index('--out') + 1], exist_ok=True)\n"
+    )
+    (repo / "serving" / "__main__.py").write_text(
+        _PROBE.format(data=str(store), extra="out['tree'] = os.path.isfile('serving/model.py')\n", dump=str(serve_dump))
+    )
+    with pytest.raises(PassError):  # the probe exits 0 without calling /ready
+        passrun.run_pass(Mode.ACCURACY, "validation", root=repo, data_dir=store, device="cpu")
+    for dump in (prep_dump, serve_dump):
+        seen = json.loads(dump.read_text())
+        assert seen["listdir"] == [] and seen["open"] == "denied"  # the data dir is an empty tmpfs
+        assert seen["hf"] == "cache"
+    assert json.loads(prep_dump.read_text())["train_bytes"] > 0  # the train export is readable
+    assert json.loads(serve_dump.read_text())["tree"] is True  # so is the serving tree
+    assert (store / "stories-validation.jsonl.gz").is_file()  # the mount was private to the child
+
+
+def test_unshare_failure_refuses_a_real_data_pass_without_fallback(repo, store, monkeypatch):
+    monkeypatch.setattr(passrun, "_UNSHARE", ["false"])
+    with pytest.raises(PassError, match="cannot be hidden") as e:
+        passrun.run_pass(Mode.ACCURACY, "validation", root=repo, data_dir=store, device="cpu")
+    assert str(store) not in e.value.message
+
+
+def test_failed_tmpfs_mount_is_reported_data_free(repo, store, monkeypatch):
+    monkeypatch.setattr(passrun, "_UNSHARE", ["unshare", "-Ur"])  # no mount namespace: the mount is refused
+    monkeypatch.setattr(passrun, "_check_can_hide", lambda *a: None)  # skip the early probe to hit the child path
+    with pytest.raises(PassError, match="cannot be hidden") as e:
+        passrun.run_pass(Mode.ACCURACY, "validation", root=repo, data_dir=store, device="cpu")
+    assert str(store) not in e.value.message
+
+
+def test_smoke_pass_does_not_need_the_namespace(repo, monkeypatch):
+    monkeypatch.setattr(passrun, "_UNSHARE", ["false"])
+    (repo / "serving" / "__main__.py").write_text("raise SystemExit(3)\n")
+    with pytest.raises(PassError, match="exited with code 3"):
+        passrun.run_pass(Mode.SMOKE, "validation", root=repo, device="cpu")
+
+
+def test_data_dir_must_not_contain_what_the_candidate_needs(tmp_path):
+    data = tmp_path / "data"
+    (data / "cache").mkdir(parents=True)
+    with pytest.raises(PassError, match="lie inside"):
+        passrun._check_can_hide(data, [data / "cache"])
+
+
+# -- an invalid pass is rerun once ---------------------------------------------------------------------
+
+
+LAG = "send lag p99 9.0 ms exceeds 5.0 ms"
+
+
+def _attempts(*scores):
+    it = iter(scores)
+    calls = []
+
+    def attempt():
+        calls.append(1)
+        return next(it)
+
+    return attempt, calls
+
+
+def test_invalid_pass_is_rerun_once_and_the_rerun_is_used(tmp_path):
+    attempt, calls = _attempts("a", "b")
+    scores = {"a": _score(valid=False, invalid_reason=LAG, send_lag_p99_ms=9.0), "b": _score()}
+    log, score, first = passrun.run_with_retry(attempt, scores.__getitem__)
+    assert (log, len(calls), score.valid, first.invalid_reason) == ("b", 2, True, LAG)
+    gate = _gate()
+    rec = _check_stream(_write(tmp_path, bench.records_for(score, gate, DIRS, first)))
+    assert rec["kind"] == "result" and rec["values"]["reruns"] == 1
+    assert rec["values"]["first_pass_send_lag_p99_ms"] == 9.0
+    assert checker.evaluate_gate(score, gate) is None
+
+
+def test_valid_pass_is_not_rerun(tmp_path):
+    attempt, calls = _attempts("a")
+    _, score, first = passrun.run_with_retry(attempt, lambda _: _score())
+    assert len(calls) == 1 and first is None
+    rec = _check_stream(_write(tmp_path, bench.records_for(score, _gate(), DIRS, first)))
+    assert rec["values"]["reruns"] == 0
+
+
+def test_two_invalid_passes_fail_and_name_both_reasons(tmp_path):
+    attempt, calls = _attempts("a", "b")
+    second = "send lag p99 7.0 ms exceeds 5.0 ms"
+    bad = {"a": _score(valid=False, invalid_reason=LAG), "b": _score(valid=False, invalid_reason=second)}
+    _, score, first = passrun.run_with_retry(attempt, bad.__getitem__)
+    assert len(calls) == 2 and not score.valid
+    err = _check_stream(_write(tmp_path, bench.records_for(score, _gate(), DIRS, first)))
+    assert err["kind"] == "error" and "after a rerun" in err["message"]
+    assert "7.0" in err["message"] and "9.0" in err["message"]
+    assert "invalid pass" in checker.evaluate_gate(score, _gate())
+
+
+def test_task_timeouts_cover_two_passes_and_prepare():
+    import tomllib
+
+    cfg = tomllib.loads((TASK / "vibesys.input.toml").read_text())
+    acc, burst = passrun.SETTINGS[Mode.ACCURACY], passrun.SETTINGS[Mode.BURSTS]
+    worst_acc = passrun.PREPARE_TIMEOUT_S + 2 * (
+        acc.ready_timeout_s + passrun.MAX_STORIES * acc.gap_cap_s + acc.drain_s + 60
+    )
+    worst_bench = passrun.PREPARE_TIMEOUT_S + 2 * (
+        burst.ready_timeout_s + passrun.BURSTS_BUDGET_S + 60 + burst.drain_s + 60
+    )
+    assert cfg["accuracy"]["timeout_seconds"] >= worst_acc
+    assert cfg["benchmark"]["timeout_seconds"] >= worst_bench

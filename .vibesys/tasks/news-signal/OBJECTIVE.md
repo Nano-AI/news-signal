@@ -26,8 +26,12 @@ Face FinBERT classifier, one headline per call. Everything the service may rely 
 - The service may not read environment variables or files beyond the contract (in particular not the scoring
   data directory, nor `/proc` entries of its parent), may not infer future stories from ids or order, and may
   not signal a story before it has received it. `newsd` refuses a signal for a story before its first
-  scheduled availability. The runtime boundary around the scoring data is rule-based beyond what the harness
-  enforces (the parent is not dumpable, the child's environment is stripped of `NEWS_SIGNAL_*`).
+  scheduled availability. On every real-data pass
+  the harness runs both `serving.prepare` and the service in an unprivileged user and mount namespace with an
+  empty tmpfs over the scoring data directory, so that directory is empty from inside and the pass is refused
+  (no fallback) if the namespace cannot be set up. The train export, the model cache and the repo stay visible.
+  The parent is not dumpable and the child's environment is stripped of `NEWS_SIGNAL_*`. The fixture check runs
+  without the namespace.
 - The service must behave the same in every pass. Detecting which pass it is in (by story count, spacing, rate,
   the parent's command line, or anything else) and changing its model or output accordingly is forbidden.
 - Log output on a failed pass reaches you truncated (20 lines of 200 characters); do not use it to move data.
@@ -42,7 +46,8 @@ duplicates. Latency of a pair is the time from `newsd` handing the story to the 
 signal for the pair. Reported: `p99_latency_ms` and `p50_latency_ms` (the objectives), `p90_latency_ms`,
 `throughput_signals_per_s`, `missed`, `duplicates`, `invalid` and `newsd_send_lag_p99_ms`. A pass with any
 missed pair beyond 0.1 %, duplicate beyond 0.1 %, or any invalid signal produces an error, not a result. So does
-a pass in which `newsd` itself fell behind (send lag p99 over 5 ms): its latencies are not trustworthy, so rerun.
+a pass in which `newsd` itself fell behind (send lag p99 over 5 ms) twice: the harness reruns an invalid pass once
+and uses the rerun, reporting `reruns` and the first pass's send lag.
 The pass also scores prediction quality: it fails if the service emits fewer than two distinct directions, or if
 its IC is below the baseline bursts IC minus 3 standard errors of the pass. The service process runs at nice 10
 so its CPU threads cannot starve `newsd`'s scheduler.

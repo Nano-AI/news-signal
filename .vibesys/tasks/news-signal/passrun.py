@@ -46,6 +46,8 @@ PREPARE_TIMEOUT_S = 1200
 MAX_FILE_BYTES = 5 * 1024 * 1024
 WEIGHT_SUFFIXES = frozenset({".safetensors", ".bin", ".pt", ".pth", ".onnx", ".gguf", ".npz", ".parquet"})
 _EXCLUDED_TOP = frozenset({".git", ".venv", ".vibesys", "infosys"})
+HIDE_FAILED_RC = 97  # the namespace wrapper could not set itself up
+_UNSHARE = ["unshare", "-Urm"]  # unprivileged user + mount namespace
 _STOP_GRACE_S = 10.0
 _EXIT_GRACE_S = 10.0  # a clean exit just before newsd reports done is not a crash
 _LOG_TAIL_LINES = 20
@@ -246,6 +248,33 @@ def _libc():
     return ctypes.CDLL(None, use_errno=True)
 
 
+def hidden(cmd: list[str], data_dir: Path | None) -> list[str]:
+    """Run `cmd` in a user+mount namespace with an empty tmpfs over the scoring data directory.
+
+    Exits HIDE_FAILED_RC if the mount fails; there is no fallback. The path is an argument, not environment.
+    """
+    if data_dir is None:
+        return cmd
+    script = f'mount -t tmpfs tmpfs "$1" || exit {HIDE_FAILED_RC}; shift; exec "$@"'
+    return [*_UNSHARE, "sh", "-c", script, "sh", str(data_dir), *cmd]
+
+
+def _check_can_hide(data_dir: Path, visible: list[Path]) -> None:
+    """Refuse the pass unless the data dir can be hidden and nothing the candidate needs sits inside it."""
+    real = data_dir.resolve()
+    for path in visible:
+        if path.resolve().is_relative_to(real):
+            raise PassError("the repo, work files or model cache lie inside the scoring data directory")
+    try:
+        r = subprocess.run(hidden(["true"], data_dir), capture_output=True, timeout=60)
+        ok = r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if not ok:
+        raise PassError("the scoring data cannot be hidden from the candidate (unshare or tmpfs mount failed); "
+                        "the pass is refused")
+
+
 def _make_undumpable() -> None:
     """PR_SET_DUMPABLE=0: the same-user serving child cannot read this process's /proc files (the store path)."""
     if sys.platform.startswith("linux"):
@@ -265,8 +294,9 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _run_prepare(root: Path, train: Path, out: Path, device: str, env: dict, log: Path) -> None:
-    cmd = [sys.executable, "-m", "serving.prepare", "--train", str(train), "--out", str(out), "--device", device]
+def _run_prepare(root: Path, train: Path, out: Path, device: str, env: dict, log: Path,
+                 hide: Path | None = None) -> None:
+    cmd = hidden([sys.executable, "-m", "serving.prepare", "--train", str(train), "--out", str(out), "--device", device], hide)
     with log.open("wb") as lf:
         proc = subprocess.Popen(cmd, cwd=root, env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
         try:
@@ -277,6 +307,8 @@ def _run_prepare(root: Path, train: Path, out: Path, device: str, env: dict, log
             raise PassError(f"prepare exceeded {PREPARE_TIMEOUT_S} s: {_tail(log)}") from None
         finally:
             _kill_group(proc.pid, signal.SIGKILL)  # stragglers of a finished prepare
+    if rc == HIDE_FAILED_RC and hide is not None:
+        raise PassError("the scoring data cannot be hidden from the candidate (tmpfs mount failed in prepare)")
     if rc != 0:
         raise PassError(f"prepare exited with code {rc}: {_tail(log)}")
 
@@ -292,7 +324,7 @@ async def _stop(proc: asyncio.subprocess.Process) -> None:
 
 
 async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, make_cmd: Callable[[str], list[str]],
-                 root: Path, env: dict, log: Path) -> PassLog:
+                 root: Path, env: dict, log: Path, hiding: bool = False) -> PassLog:
     """Serve `plan` while racing the service process: its early exit fails the pass at once."""
     from infosys.newsd import ReadyTimeout, serve_pass
 
@@ -328,6 +360,9 @@ async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, ma
             if not serve.done():
                 serve.cancel()
                 await asyncio.gather(serve, return_exceptions=True)
+                if rc == HIDE_FAILED_RC and hiding:
+                    raise PassError("the scoring data cannot be hidden from the candidate (tmpfs mount failed); "
+                                    "the pass is refused")
                 raise PassError(f"serving exited with code {rc} before the pass ended: {_tail(log)}")
         return serve.result()
     except ReadyTimeout as e:
@@ -349,7 +384,21 @@ class PassResult:
     plan: ReplayPlan
     log: PassLog
     bars: Bars
-    score: PassScore
+    score: PassScore  # of the last attempt
+    first_invalid: PassScore | None = None  # the first attempt, when it was invalid and the pass was rerun
+
+
+def run_with_retry(attempt: Callable[[], PassLog], score: Callable[[PassLog], PassScore]):
+    """Run a pass; if it comes out invalid (newsd fell behind), run it once more and use the rerun.
+
+    Returns (log, score, first_invalid_score_or_None). The gate fails only if the rerun is also invalid.
+    """
+    log = attempt()
+    first = score(log)
+    if first.valid:
+        return log, first, None
+    log = attempt()
+    return log, score(log), first
 
 
 def rescore(result: PassResult, horizon_min: int) -> PassScore:
@@ -423,35 +472,45 @@ def run_pass(
                      warmup_rate_hz=settings.warmup_hz)
 
     env = _sanitized_env()
+    hide = None if mode is Mode.SMOKE else data_dir
     with tempfile.TemporaryDirectory(prefix="ns-pass-") as tmp:
         tmp_dir = Path(tmp)
+        if hide is not None:
+            hf = os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE")
+            _check_can_hide(hide, [root, tmp_dir, *([Path(hf)] if hf else [])])
         train_file, prepared = tmp_dir / "train.jsonl.gz", tmp_dir / "prepared"
         _write_train_file(train_file, train, train_bars, gate["h_minutes"])
-        _run_prepare(root, train_file, prepared, device, env, tmp_dir / "prepare.log")
+        _run_prepare(root, train_file, prepared, device, env, tmp_dir / "prepare.log", hide)
 
         def make_cmd(url: str) -> list[str]:
-            return [sys.executable, "-m", "serving", "--newsd", url, "--model", model, "--device", device,
-                    "--prepared", str(prepared)]
+            return hidden([sys.executable, "-m", "serving", "--newsd", url, "--model", model, "--device", device,
+                           "--prepared", str(prepared)], hide)
 
-        drive = _drive(
-            plan,
-            ready_timeout_s=settings.ready_timeout_s,
-            drain_s=settings.drain_s if drain_s is None else drain_s,
-            make_cmd=make_cmd,
-            root=root,
-            env=env,
-            log=tmp_dir / "serving.log",
-        )
+        def attempt() -> PassLog:
+            return asyncio.run(
+                _drive(
+                    plan,
+                    ready_timeout_s=settings.ready_timeout_s,
+                    drain_s=settings.drain_s if drain_s is None else drain_s,
+                    make_cmd=make_cmd,
+                    root=root,
+                    env=env,
+                    log=tmp_dir / "serving.log",
+                    hiding=hide is not None,
+                )
+            )
+
         # A full collection over the loaded stores would stall newsd's scheduler for ~100 ms (and fail the
         # send-lag gate), so the heap is frozen while the pass runs.
         gc.collect()
         gc.freeze()
         try:
-            log = asyncio.run(drive)
+            log, score, first = run_with_retry(
+                attempt, lambda lg: score_pass(plan, lg, bars, horizon_min=gate["h_minutes"])
+            )
         finally:
             gc.unfreeze()
-    score = score_pass(plan, log, bars, horizon_min=gate["h_minutes"])
-    return PassResult(plan, log, bars, score)
+    return PassResult(plan, log, bars, score, first)
 
 
 if __name__ == "__main__":
