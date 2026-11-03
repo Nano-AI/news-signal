@@ -54,3 +54,9 @@ def test_high_entropy_assignment():
     assert rules(f'{"SE" + "CRET"}: {HIGH_ENTROPY}') == ["secret-shaped"]
     assert rules(f'{"to" + "ken"} = "{"a" * 24}"') == []  # low entropy
     assert rules(f"name = {HIGH_ENTROPY}") == []  # not a secret-like name
+
+
+def test_tokenizer_path_is_not_a_secret_but_a_random_token_is():
+    assert rules('tokenizer_path = "ProsusAI/finbert"') == []
+    assert rules(f'{"to" + "ken"} = "{FAKE_BASE62_40}"') == ["secret-shaped"]
+    assert rules(f'ACCESS_{"TO" + "KEN"}: {HIGH_ENTROPY}') == ["secret-shaped"]

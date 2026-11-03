@@ -133,6 +133,8 @@ the end. `released` is the number of stories released on any feed so far; `total
 
 - Every feed copy of a story carries the canonical `story_id`.
 - Synthetic feeds copy content exactly and change only timing, drops and duplicates.
+- Real feeds (Benzinga, EDGAR) never drop a story; drops happen only on synthetic copies. So every
+  `(story_id, ticker)` pair becomes available through its real feed.
 - Receipt time is newsd's clock when the request body has been read.
 - After `end` (ws) or `end: true` (poll), the server closes.
 

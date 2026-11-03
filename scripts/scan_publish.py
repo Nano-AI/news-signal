@@ -21,7 +21,9 @@ ABS_PATH = re.compile(r"(^|[^\w.~])/(Users|home|home1|work|work1|scratch)/")
 ALPACA_KEY_ID = re.compile(r"(?<![A-Za-z0-9])(PK|AK)[A-Z0-9]{16,}(?![A-Za-z0-9])")
 BASE62_40 = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9]{40}(?![A-Za-z0-9+/_-])")
 SECRET_ASSIGNMENT = re.compile(
-    r"\w*(?:key|secret|token|passw(?:or)?d)\w*\s*[:=]\s*[\"']?([A-Za-z0-9+/_=-]{20,})", re.IGNORECASE
+    r"(?<![A-Za-z0-9])(?:api_?key|secret(?:_key)?|(?:access_)?token|passw(?:or)?d)(?![A-Za-z])"
+    r"\s*[:=]\s*[\"']?([A-Za-z0-9+/_=-]{20,})",
+    re.IGNORECASE,
 )
 MIN_ENTROPY = 3.5  # bits per character
 DATA_SUFFIXES = (".jsonl.gz", ".npz", ".parquet", ".csv")
