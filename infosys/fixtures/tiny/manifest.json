@@ -1,0 +1,30 @@
+{
+  "files": {
+    "bars-holdout.npz": {
+      "rows": 4680,
+      "sha256": "78c8e3c07dc605077f20f3963d9d19894ed7c9eea28c8b1201006847c42add59"
+    },
+    "bars-train.npz": {
+      "rows": 7800,
+      "sha256": "3bb1dbfd31eaef2e32e78264784a3f34fedc68c77ec1f6119e40c027ef4c2b99"
+    },
+    "bars-validation.npz": {
+      "rows": 7800,
+      "sha256": "85dbbf2c4ec3412e7e53df20200d44a9c7441566580c97c66fdc3abf399604a9"
+    },
+    "stories-holdout.jsonl.gz": {
+      "rows": 60,
+      "sha256": "a67e396279f609aebfb7b29cd94ca555c4297d8f09714318543d6ef838700cae"
+    },
+    "stories-train.jsonl.gz": {
+      "rows": 60,
+      "sha256": "9698a6bcf6c1b1cfdd625dbaafa397eae5b3b1fd9908db452e1ec389e79a931d"
+    },
+    "stories-validation.jsonl.gz": {
+      "rows": 120,
+      "sha256": "0d9fa9a328622f4bfe071da4c20103d299130fe6897bb33c9cd1eeb81dd2a5da"
+    }
+  },
+  "fixture": "tiny",
+  "format": 1
+}
