@@ -1,6 +1,6 @@
 # PLACEHOLDER VALUES. The baseline is pending: `frozen = false` makes the accuracy gate fail until
 # scripts/freeze_baseline.py measures the unmodified serving/ on real data and rewrites this file.
-infosys_sha256 = "69ba1bb053746c6c0e2e07e523a7055bc874fb6ca345fd91bf225beccec2b070"
+infosys_sha256 = "2b16ddf07fbacade6df9a7270db60bf69a41ab899568769c9b0ead941b75a422"
 h_minutes = 5
 h_reason = "PENDING: chosen by the noise rule in scripts/freeze_baseline.py"
 max_missed_frac = 0.001

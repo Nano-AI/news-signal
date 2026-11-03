@@ -133,7 +133,7 @@ the end. `released` is the number of stories released on any feed so far; `total
   candidate that stops reading gains nothing), the moment the message becomes pollable on a `poll` feed. Receipt is the first accepted signal for the pair. Both are on newsd's
   clock. A pair never signaled counts as missed, with latency `end - min send` (`end` is the end of the drain).
   A story never sent on any feed uses its scheduled instant (`release + feed delay`) instead.
-- **Invalid pass**: newsd also records, for every delivery, its lateness (actual send minus scheduled send).
+- **Invalid pass**: newsd also records, for every delivery of a measured story (warmup excluded), its lateness (actual send minus scheduled send).
   If the 99th percentile of that lateness exceeds 5 ms the server fell behind and the pass is marked
   invalid in the score (`valid: false` with a reason); its latencies are not to be trusted.
 

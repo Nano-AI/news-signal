@@ -424,3 +424,34 @@ def test_non_reading_candidate_cannot_lower_its_latency():
     for story_id, scheduled in plan.available_s.items():
         assert dawdling.sent_s[story_id] == pytest.approx(reading.sent_s[story_id], abs=1e-6)
         assert dawdling.sent_s[story_id] == pytest.approx(scheduled, abs=1e-6)
+
+
+def test_send_lag_counts_measured_deliveries_only():
+    """A warmup delivery that is very late (a cold-starting candidate) is not the server falling behind."""
+    warmup, measured = _story(0, 0), _story(1, 50)
+    plan = plan_pass(
+        [measured], [warmup], gap_cap_s=100, seed=0, feeds=FAST_FEEDS[:2], warmup_rate_hz=0.1, warmup_gap_s=0.0
+    )
+    clock = FakeClock()
+
+    async def main():
+        server = await Server(plan, clock=clock).start()
+        async with aiohttp.ClientSession() as s:
+            async with s.post(server.url + "/ready"):
+                pass
+            t0 = clock() + 1.0
+            clock.now = t0 + max(d.at_s for d in plan.deliveries)  # the measured story is on time, warmup ~10 s late
+            for _ in range(2000):  # hang guard: ~10 s
+                async with s.get(server.url + "/status") as r:
+                    if (await r.json())["released"] == 1:
+                        break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("delivery never happened")
+        clock.now += 1000
+        return await server.result()
+
+    log = _run(main())
+    n_measured = sum(d.story.story_id == measured.story_id for d in plan.deliveries)
+    assert len(log.send_lag_ms) == n_measured < len(plan.deliveries)
+    assert max(log.send_lag_ms) < 1000

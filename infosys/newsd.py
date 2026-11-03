@@ -40,7 +40,7 @@ class PassLog:
     signals: list[ReceivedSignal]  # accepted signals, duplicates included
     invalid: dict[str, int]  # rejection reason -> count
     schema_errors: int
-    send_lag_ms: list[float]  # actual - scheduled send instant, per delivery, in ms
+    send_lag_ms: list[float]  # actual - scheduled send instant, per delivery of a measured story, in ms
     end_s: float
     # story_id -> earliest instant newsd handed the story to a subscriber's queue (ws) or made it pollable
     # (poll), in seconds since t0. Latency is measured from it.
@@ -154,8 +154,9 @@ class _Pass:
     async def deliver(self, d: Delivery) -> None:
         assert self.t0 is not None
         await self.sleep_until(d.at_s)
-        self.log.send_lag_ms.append((self.clock() - (self.t0 + d.at_s)) * 1000)
         story = d.story
+        if story.story_id in self.measured_ids:  # warmup is where the candidate cold-starts: its lateness is not the server falling behind
+            self.log.send_lag_ms.append((self.clock() - (self.t0 + d.at_s)) * 1000)
         msg = StoryMessage(
             type="story",
             feed=d.feed,
