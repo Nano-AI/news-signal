@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -48,7 +48,7 @@ def _chain(client: CachedClient, url: str, params: dict[str, str], headers: dict
         params = {**params, "page_token": token}
 
 
-def fetch_news(client: CachedClient, start: date, end: date, *, headers: dict[str, str]) -> int:
+def fetch_news(client: CachedClient, start: date, end: date, *, headers: dict[str, str], log: Callable[[str], None] = lambda _: None) -> int:
     pages = 0
     for lo, hi in _months(start, end):
         params = {
@@ -60,7 +60,9 @@ def fetch_news(client: CachedClient, start: date, end: date, *, headers: dict[st
             "include_content": "false",
             "exclude_contentless": "false",
         }
-        pages += _chain(client, NEWS_URL, params, headers)
+        n = _chain(client, NEWS_URL, params, headers)
+        pages += n
+        log(f"news {lo:%Y-%m}: pages={n}")
     return pages
 
 

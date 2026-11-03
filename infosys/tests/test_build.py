@@ -136,3 +136,24 @@ def test_tmp_files_in_cache_are_ignored(tmp_path):
     junk = next((tmp_path / "cache").rglob("*.json")).with_suffix(".json.tmp")
     junk.write_text("{half")
     build(tmp_path / "cache", tmp_path / "out", END)
+
+
+def test_build_twice_same_digest(tmp_path):
+    records = [
+        _news(_item(1, "2023-01-03T15:00:00Z", ["AAPL", "MSFT"]), _item(2, "2024-08-01T15:00:00Z", ["NVDA"])),
+        (BARS_URL, {"m": "1"}, {"bars": {"AAPL": [{"t": "2023-01-03T15:00:00Z", "o": 1.0, "c": 2.0}]}, "next_page_token": None}),
+    ]
+    _write_cache(tmp_path / "cache", records)
+    a = build(tmp_path / "cache", tmp_path / "a", END)
+    b = build(tmp_path / "cache", tmp_path / "b", END)
+    assert a == b and a["files"]["stories-train.jsonl.gz"]["sha256"]
+
+
+def test_corrupt_cache_entries_skipped_and_reported(tmp_path, capsys):
+    _write_cache(tmp_path / "cache", [_news(_item(1, "2023-01-03T15:00:00Z", ["AAPL"]))])
+    good = next((tmp_path / "cache").rglob("*.json"))
+    bad = good.parent / ("0" * 64 + ".json")
+    bad.write_text("")
+    build(tmp_path / "cache", tmp_path / "out", END)
+    assert "skipped corrupt cache entries: 1" in capsys.readouterr().out
+    assert set(_stories(tmp_path / "out", "train")) == {"bz:1"}

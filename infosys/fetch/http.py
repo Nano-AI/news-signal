@@ -12,7 +12,8 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-BACKOFF_S = (2, 4, 8, 16, 32)
+# 2..32 s, then 60 s waits: about 10 minutes of outage are survived before giving up
+BACKOFF_S = (2, 4, 8, 16, 32, *(60,) * 9)
 Transport = Callable[[str, Mapping[str, str]], tuple[int, bytes]]
 
 
@@ -65,19 +66,31 @@ class CachedClient:
         key = hashlib.sha256(f"{url}?{query}".encode()).hexdigest()
         path = self._dir / key[:2] / f"{key}.json"
         if path.is_file():  # only a finished record has this name; `.tmp` files never match
-            self.cache_hits += 1
-            return json.loads(path.read_text())["body"]
+            try:
+                body = json.loads(path.read_text())["body"]
+            except (ValueError, KeyError, TypeError):
+                print(f"cache entry {key[:12]} is corrupt; refetching", flush=True)
+            else:
+                self.cache_hits += 1
+                return body
         full = f"{url}?{query}" if query else url
         for delay in (*BACKOFF_S, None):
             self._pace()
             self.network_requests += 1
             status, raw = self._transport(full, headers)
+            body = None
             if status == 200:
-                break
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    pass
+                if isinstance(body, dict):
+                    break
+                status = 502  # an empty or garbled 200 is a transient fault: retry like a 5xx
             if delay is None or not (status == 429 or status >= 500):
                 raise FetchError(status, full)
             self._sleep(delay)
-        record = {"url": url, "params": dict(params), "status": status, "body": json.loads(raw)}
+        record = {"url": url, "params": dict(params), "status": 200, "body": body}
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(record))

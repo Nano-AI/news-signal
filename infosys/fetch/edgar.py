@@ -7,12 +7,13 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
-from infosys.fetch.http import CachedClient
+from infosys.fetch.http import CachedClient, FetchError
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/"
 
-# UNVERIFIED (Step 5 blocked by SEC 403): rule to confirm is "acceptanceDateTime wall-clock is in this zone".
+# Rule: a stamp with an explicit offset or `Z` is taken as written; only a naive stamp is read as wall-clock in this zone.
+# UNVERIFIED against the real index page (Step 5).
 ACCEPTANCE_TZ = "UTC"
 
 ITEM_TITLES: dict[str, str] = {
@@ -62,9 +63,23 @@ def contact_email(override: str | None) -> str:
 
 
 def acceptance_utc(acceptance: str, tz: str = ACCEPTANCE_TZ) -> datetime:
-    """Convert a submissions `acceptanceDateTime` to UTC, reading its wall-clock part in `tz`."""
-    naive = datetime.fromisoformat(acceptance.removesuffix("Z")).replace(tzinfo=None, microsecond=0)
-    return naive.replace(tzinfo=ZoneInfo(tz)).astimezone(UTC)
+    """Convert an `acceptanceDateTime` to UTC; `tz` applies only when the stamp carries no offset or `Z`."""
+    stamp = datetime.fromisoformat(acceptance).replace(microsecond=0)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=ZoneInfo(tz))
+    return stamp.astimezone(UTC)
+
+
+def preflight(client: CachedClient, email: str) -> None:
+    """Fail fast, before any long pull, if SEC will refuse this contact. The response is cached."""
+    if "noreply" in email.lower():
+        raise ValueError("EDGAR contact is a noreply address; pass a real one with --contact-email")
+    try:
+        client.get_json(TICKERS_URL, {}, {"User-Agent": f"news-signal research {email}"})
+    except FetchError as e:
+        if e.status == 403:
+            raise ValueError("SEC refused the contact (HTTP 403); pass a real address with --contact-email") from e
+        raise
 
 
 def fetch_8k(client: CachedClient, tickers: Sequence[str], start: date, end: date, email: str) -> int:

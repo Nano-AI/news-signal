@@ -18,19 +18,24 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--start", type=date.fromisoformat, default=date(2020, 1, 1))
     ap.add_argument("--end", type=date.fromisoformat, default=datetime.now(UTC).date(), help="exclusive")
     ap.add_argument("--contact-email")
+    ap.add_argument("--skip-edgar", action="store_true")
     args = ap.parse_args(argv)
 
     headers = alpaca.load_keys(args.env_file)
-    email = edgar.contact_email(args.contact_email)  # EDGAR runs last so a block there cannot stop the Alpaca pull
     client = CachedClient(args.cache)
+    email = None
+    if not args.skip_edgar:
+        email = edgar.contact_email(args.contact_email)
+        edgar.preflight(client, email)  # fail now, not hours in
 
-    def progress(label: str, pages: int) -> None:
-        print(f"{label}: pages={pages} requests={client.network_requests} hits={client.cache_hits}", flush=True)
+    def log(line: str) -> None:
+        print(f"{line} requests={client.network_requests} hits={client.cache_hits}", flush=True)
 
-    progress("news", alpaca.fetch_news(client, args.start, args.end, headers=headers))
+    alpaca.fetch_news(client, args.start, args.end, headers=headers, log=log)
     for ticker in TICKERS:
-        progress(f"bars {ticker}", alpaca.fetch_bars(client, ticker, args.start, args.end, headers=headers))
-    progress("edgar", edgar.fetch_8k(client, TICKERS, args.start, args.end, email))
+        log(f"bars {ticker}: pages={alpaca.fetch_bars(client, ticker, args.start, args.end, headers=headers)}")
+    if email is not None:
+        log(f"edgar: docs={edgar.fetch_8k(client, TICKERS, args.start, args.end, email)}")
     print("fetch complete")
 
 

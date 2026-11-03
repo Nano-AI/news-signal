@@ -31,9 +31,18 @@ from infosys.universe import MAX_TICKERS_PER_STORY, TICKERS
 _TAG = re.compile(r"<[^>]*>")
 
 
-def _records(cache: Path) -> Iterator[dict]:
+def _records(cache: Path) -> tuple[list[dict], int]:
+    """Every readable cache record in path order, and the number of corrupt ones skipped."""
+    records, corrupt = [], 0
     for path in sorted(cache.glob("*/*.json")):  # `.json.tmp` files never match
-        yield json.loads(path.read_text())
+        try:
+            rec = json.loads(path.read_text())
+            rec["url"], rec["body"]
+        except (ValueError, KeyError, TypeError):
+            corrupt += 1
+            continue
+        records.append(rec)
+    return records, corrupt
 
 
 def _utc(stamp: str) -> datetime:
@@ -82,7 +91,10 @@ def build(cache: Path, out: Path, end: date) -> dict:
     cik_ticker: dict[int, str] = {}
     names: dict[int, str] = {}
     filings: list[tuple[int, dict]] = []
-    for rec in _records(cache):
+    records, corrupt = _records(cache)
+    if corrupt:
+        print(f"skipped corrupt cache entries: {corrupt}")
+    for rec in records:
         url, body = rec["url"], rec["body"]
         if url == NEWS_URL:
             news.extend(body["news"])

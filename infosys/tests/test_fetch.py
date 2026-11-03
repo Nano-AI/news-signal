@@ -89,11 +89,12 @@ def test_retry_on_429_then_ok(tmp_path):
 
 def test_retry_exhaustion_raises(tmp_path):
     time = FakeTime()
-    t = FakeTransport([(500, {})] * 6)
+    t = FakeTransport([(500, {})] * 30)
     with pytest.raises(FetchError):
         _client(tmp_path, t, time).get_json(URL, {}, {})
-    assert [s for s in time.sleeps if s >= 2] == [2, 4, 8, 16, 32]
-    assert len(t.calls) == 6
+    waits = [s for s in time.sleeps if s >= 2]
+    assert waits[:6] == [2, 4, 8, 16, 32, 60] and max(waits) == 60
+    assert 540 <= sum(waits) <= 660 and len(t.calls) == len(waits) + 1
 
 
 def test_4xx_raises_without_headers(tmp_path):
@@ -138,7 +139,7 @@ def test_resume_replays_page_chain(tmp_path):
 
 
 def test_interrupted_chain_resumes_from_cache(tmp_path):
-    t = FakeTransport(_news_pages(3)[:2] + [(500, {})] * 6)
+    t = FakeTransport(_news_pages(3)[:2] + [(500, {})] * 30)
     with pytest.raises(FetchError):
         alpaca.fetch_news(_client(tmp_path, t), date(2023, 5, 1), date(2023, 6, 1), headers={})
     rest = FakeTransport(_news_pages(3)[2:])
@@ -207,11 +208,76 @@ def test_contact_email_override():
 @pytest.mark.parametrize(
     ("stamp", "tz", "expected"),
     [
-        ("2023-11-02T16:30:19.000Z", "UTC", "2023-11-02T16:30:19+00:00"),
-        ("2023-11-02T16:30:19.000Z", "America/New_York", "2023-11-02T20:30:19+00:00"),  # EDT
-        ("2024-01-10T16:30:19.000Z", "America/New_York", "2024-01-10T21:30:19+00:00"),  # EST
+        ("2023-11-02T16:30:19", "UTC", "2023-11-02T16:30:19+00:00"),
+        ("2023-11-02T16:30:19", "America/New_York", "2023-11-02T20:30:19+00:00"),  # EDT
+        ("2024-01-10T16:30:19.000", "America/New_York", "2024-01-10T21:30:19+00:00"),  # EST
+        ("2023-11-02T16:30:19.000Z", "America/New_York", "2023-11-02T16:30:19+00:00"),  # Z wins
+        ("2023-11-02T16:30:19-04:00", "UTC", "2023-11-02T20:30:19+00:00"),  # explicit offset wins
     ],
 )
 def test_acceptance_conversion(stamp, tz, expected):
     assert edgar.acceptance_utc(stamp, tz).isoformat() == expected
-    assert edgar.acceptance_utc(stamp, tz).tzinfo is not None
+
+
+@pytest.mark.parametrize("bad", [b"", b"{half", b"[1]", b"null"])
+def test_garbled_200_is_retried(tmp_path, bad):
+    time = FakeTime()
+    answers = iter([bad, b'{"ok": 1}'])
+    calls = []
+
+    def transport(url, headers):
+        calls.append(url)
+        return 200, next(answers)
+
+    assert _client(tmp_path, transport, time).get_json(URL, {}, {}) == {"ok": 1}
+    assert len(calls) == 2 and 2 in time.sleeps
+
+
+def test_garbled_forever_raises(tmp_path):
+    with pytest.raises(FetchError):
+        _client(tmp_path, lambda u, h: (200, b""), FakeTime()).get_json(URL, {}, {})
+
+
+def test_corrupt_cache_entry_is_a_miss(tmp_path, capsys):
+    client = _client(tmp_path, FakeTransport([(200, {"v": 1})]))
+    client.get_json(URL, {}, {})
+    (record,) = (tmp_path / "cache").rglob("*.json")
+    record.write_text("")  # a crash left an empty final-named file
+    t2 = FakeTransport([(200, {"v": 2})])
+    assert _client(tmp_path, t2).get_json(URL, {}, {}) == {"v": 2}
+    assert json.loads(record.read_text())["body"] == {"v": 2}
+    assert "corrupt" in capsys.readouterr().out
+    assert not list((tmp_path / "cache").rglob("*.tmp"))
+
+
+def test_failure_paths_leak_no_key(tmp_path, capsys):
+    headers = {"APCA-API-KEY-ID": SENTINEL, "APCA-API-SECRET-KEY": SENTINEL}
+    for answers in ([(401, {})], [(429, {})] * 30, [(200, {})]):
+        t = FakeTransport(answers)
+        bad = (lambda u, h: (200, b"<html>")) if answers == [(200, {})] else t
+        with pytest.raises(FetchError) as err:
+            _client(tmp_path, bad, FakeTime()).get_json(URL, {"p": str(len(answers))}, headers)
+        assert SENTINEL not in str(err.value) + repr(err.value)
+    out = capsys.readouterr()
+    assert SENTINEL not in out.out + out.err
+    for f in (tmp_path / "cache").rglob("*"):
+        if f.is_file():
+            assert SENTINEL not in f.read_text()
+
+
+def test_preflight_rejects_noreply_and_403(tmp_path):
+    t = FakeTransport()
+    with pytest.raises(ValueError, match="noreply"):
+        edgar.preflight(_client(tmp_path, t), "1+x@users.noreply.github.com")
+    assert not t.calls
+    with pytest.raises(ValueError, match="403"):
+        edgar.preflight(_client(tmp_path, FakeTransport([(403, {})])), "me@example.test")
+    ok = FakeTransport()
+    edgar.preflight(_client(tmp_path, ok), "me@example.test")
+    assert ok.calls[0][1]["User-Agent"] == "news-signal research me@example.test"
+
+
+def test_news_logs_each_month(tmp_path):
+    lines: list[str] = []
+    alpaca.fetch_news(_client(tmp_path, FakeTransport()), date(2023, 11, 1), date(2024, 2, 1), headers={}, log=lines.append)
+    assert lines == ["news 2023-11: pages=1", "news 2023-12: pages=1", "news 2024-01: pages=1"]
