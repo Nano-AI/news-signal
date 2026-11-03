@@ -832,3 +832,14 @@ def test_freeze_refuses_a_bench_result_that_breaks_the_send_lag_rule(freezer):
     _artifacts(fz, runs, lag_p90=6.0)
     with pytest.raises(SystemExit, match="send lag p90 6.0 ms"):
         fz.freeze()
+
+
+def test_gate_commands_are_plain_uv_run_python():
+    """VibeSys's Slurm policy rewrites only `uv run python <script>` to the operator interpreter; a flag between breaks it."""
+    import tomllib
+
+    spec = tomllib.loads((TASK / "vibesys.input.toml").read_text())
+    for gate, script in (("accuracy", "accuracy_checker/checker.py"), ("benchmark", "benchmark/run.py")):
+        cmd = spec[gate]["command"]
+        assert cmd[:3] == ["uv", "run", "python"], cmd
+        assert cmd[3] == f"${{PROJECT_ROOT}}/.vibesys/tasks/news-signal/{script}", cmd

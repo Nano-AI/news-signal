@@ -20,7 +20,7 @@ stories, memoize the scoring data, or starve the clock that measures it. The des
   only `docs/protocol.md`. `tests/test_boundaries.py` checks that neither imports the other.
 - **Pinned evaluator.** Digests of `infosys/` and of `pyproject.toml`, `uv.lock` and `docs/protocol.md` are pinned
   in `.vibesys/tasks/news-signal/gate.toml`. A pass is refused, before it runs, if any of them differs. The
-  harness runs `uv run --frozen`, so the lockfile is never re-resolved.
+  harness runs `uv run`; the pinned `pyproject.toml` and `uv.lock` keep the dependencies fixed.
 - **Hidden scoring data.** On real data, the candidate runs where the data cannot be seen (see "The hiding
   wrapper").
 - **A fair clock.** Latency starts when `newsd` hands the story over, and a pass is thrown out if `newsd` itself
@@ -135,7 +135,7 @@ before any `uv run`. `cpu_check/run.sh` does this itself and uses `$XDG_CACHE_HO
 
 The real data comes from Alpaca (news and bars) and SEC EDGAR. You need an Alpaca key file in dotenv format.
 Pass it with `--env-file`. Never commit it. The fetch CLI prints counts only, never keys. EDGAR asks for a
-contact address: pass `--contact-email`, or the CLI uses `git config user.email`. Use `--skip-edgar` to leave
+contact address: pass `--contact-email` with a real address (a `noreply` address is rejected), or use `--skip-edgar` to leave
 EDGAR out.
 
 ```bash
@@ -175,8 +175,8 @@ real data.
    and `[benchmark]` commands in `vibesys.input.toml`:
 
    ```bash
-   uv run --frozen python .vibesys/tasks/news-signal/accuracy_checker/checker.py
-   uv run --frozen python .vibesys/tasks/news-signal/benchmark/run.py --mode bursts --vs-output <path>
+   uv run python .vibesys/tasks/news-signal/accuracy_checker/checker.py
+   uv run python .vibesys/tasks/news-signal/benchmark/run.py --mode bursts --vs-output <path>
    ```
 
    VibeSys appends `--vs-output` itself and reads the `p99_latency_ms` and `p50_latency_ms` objectives.
@@ -184,8 +184,8 @@ real data.
    choosing between candidates:
 
    ```bash
-   uv run --frozen python .vibesys/tasks/news-signal/accuracy_checker/checker.py --report --split holdout
-   uv run --frozen python .vibesys/tasks/news-signal/benchmark/run.py --mode bursts --split holdout --vs-output <path>
+   uv run python .vibesys/tasks/news-signal/accuracy_checker/checker.py --report --split holdout
+   uv run python .vibesys/tasks/news-signal/benchmark/run.py --mode bursts --split holdout --vs-output <path>
    ```
 
 ### Freezing the baseline
@@ -206,7 +206,7 @@ The script is idempotent and uses only the standard library. Its stages, in orde
 | `manifest` | Copies the store's manifest into the task as the pin. |
 | `pin` | Writes the digests of `infosys/` and of `pyproject.toml`, `uv.lock`, `docs/protocol.md` into `gate.toml`. |
 | `budget` | Checks the bursts replay has at least 300 stories, or raises the window budget. |
-| `cpu-acc` | Dry-runs the accuracy checker on CPU at every horizon (5, 15, 30, 60 minutes). |
+| `cpu-acc` | Dry-runs the accuracy checker on CPU at every horizon (5, 15, 30, 60 minutes). This stage is slow (CPU FinBERT over the whole sample) and prints no progress. |
 | `h` | Picks the horizon H: the first whose IC is more than two standard errors above zero. |
 | `sizing` | Caps the accuracy sample so its replay fits the time budget. |
 | `sync` | Refuses a dirty `serving/` or `infosys/`, then copies the checkout and store to the cluster. |

@@ -15,8 +15,8 @@ Face FinBERT classifier, one headline per call. Everything the service may rely 
 - `infosys/`, `docs/protocol.md`, `pyproject.toml`, `uv.lock` and `.vibesys/` are read-only. Digests of `infosys/`
   and of the other three files are pinned in the task; both gates fail, without measuring, if any differs. The
   environment is fixed for this trial: the service may build extensions or vendor code inside `serving/` using
-  packages already installed, but may not add dependencies. (The gates run with `uv run --frozen` where uv is
-  used; on the cluster the shared, pre-built environment plays that role and is outside the tree.)
+  packages already installed, but may not add dependencies. (The pinned `pyproject.toml` and `uv.lock` keep the
+  dependencies fixed; on the cluster the shared, pre-built environment is outside the tree.)
 - No weights and no data in git: a file over 5 MB, or with a suffix in `.safetensors .bin .pt .pth .onnx .gguf
   .npz .parquet` anywhere outside `infosys/` and `.vibesys/`, fails both gates.
 - Only packages installed in the evaluation environment may be imported. The only model available offline is
@@ -41,6 +41,8 @@ Face FinBERT classifier, one headline per call. Everything the service may rely 
   discarded. Prepare may warm caches into its work directory and the service reads them there. The service must
   not persist or transmit anything derived from the stories (memoised outputs, logs of headlines, a network
   call) by any path the wrapper does not cover either; the network is not restricted by the harness.
+- `serving.prepare` is not write-confined, so its outputs persist across rounds. It may persist only artifacts
+  derived from the train split and the model, never anything derived from a pass.
 - The service must behave the same in every pass. Detecting which pass it is in (by story count, spacing, rate,
   the parent's command line, or anything else) and changing its model or output accordingly is forbidden.
 - Log output on a failed pass reaches you truncated (20 lines of 200 characters); do not use it to move data.
@@ -58,7 +60,7 @@ missed pair beyond 0.1 %, duplicate beyond 0.1 %, or any invalid signal produces
 a pass in which `newsd` itself fell behind (send lag p90 over 5 ms or p99 over 50 ms) twice: the harness reruns an invalid pass once
 and uses the rerun, reporting `reruns` and the first pass's send lag.
 Systematic server lateness, which is what a CPU-starving candidate causes, moves p90, while rare node stalls only
-move the tail (an idle GPU node showed intermittent 15-20 ms stalls with p90 under 1.5 ms). A stall bunches late
+move the tail (an idle GPU node showed intermittent 15-20 ms stalls; measured passes kept p90 around 1.5 ms). A stall bunches late
 stories, which makes the candidate's job harder, not easier, and latency is measured from the enqueue instant, so
 stalls never flatter the candidate.
 The pass also scores prediction quality: it fails if the service emits fewer than two distinct directions, or if
