@@ -56,14 +56,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         horizons = [int(h) for h in a.horizons.split(",")] if a.horizons else None
+    except ValueError:
+        print("FAIL: --horizons must be comma-separated integers")
+        return 1
+    try:
         gate = load_gate()
         if not a.report and not gate["baseline"]["frozen"]:
             print(f"FAIL: {NOT_FROZEN}")
             return 1
         result = run_pass(Mode.ACCURACY, a.split, device=a.device, drain_s=a.drain_s)
-    except ValueError:
-        print("FAIL: --horizons must be comma-separated integers")
-        return 1
     except PassError as e:
         print(e.message)
         return 1
@@ -82,13 +83,11 @@ def main(argv: list[str] | None = None) -> int:
     if not s.valid:
         print(f"note: invalid pass: {s.invalid_reason}")
     if a.json_out:
-        span_s = (s.signaled / s.throughput_per_s) if s.throughput_per_s else 0.0
         a.json_out.write_text(
             json.dumps(
                 {
                     "score": asdict(s),
                     "horizons": per_horizon,
-                    "ms_per_headline": 1000 * span_s / s.stories if s.stories else None,
                 },
                 indent=2,
             )

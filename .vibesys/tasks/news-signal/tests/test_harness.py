@@ -2,6 +2,7 @@
 
 import json
 import math
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -10,7 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 import infosys  # noqa: F401  imported first so a temp-copy run_pass never shadows the real package
@@ -52,10 +53,13 @@ def _score(**kw) -> PassScore:
     return PassScore(**{**base, **kw})
 
 
+DIRS = {-1, 0, 1}
+
+
 def _gate(frozen=True, floor=0.03) -> dict:
     return {
         "max_missed_frac": 0.001, "max_duplicate_frac": 0.001, "max_invalid": 0,
-        "baseline": {"frozen": frozen, "ic_floor": floor},
+        "baseline": {"frozen": frozen, "ic_floor": floor, "bursts_ic": 0.05},
     }  # fmt: skip
 
 
@@ -66,12 +70,16 @@ def test_infosys_pin_matches_tree():
     assert passrun.infosys_digest(ROOT) == passrun.load_gate()["infosys_sha256"]
 
 
+def test_repo_pin_matches_tree():
+    assert passrun.repo_digest(ROOT) == passrun.load_gate()["repo_sha256"]
+
+
 def test_gate_toml_complete():
     gate = passrun.load_gate()
     assert isinstance(gate["h_minutes"], int) and gate["h_minutes"] > 0
     assert len(gate["infosys_sha256"]) == 64
     base = gate["baseline"]
-    assert isinstance(base["frozen"], bool)
+    assert isinstance(base["frozen"], bool) and isinstance(base["bursts_ic"], float)
     assert all(isinstance(v, float) for v in base["p99_ms"]) and len(base["p99_ms"]) == 2
     if base["frozen"]:
         assert base["ic_floor"] <= base["ic"] and base["validation_stories"] > 0 and base["scored_pairs"] > 0
@@ -135,10 +143,15 @@ def test_serving_crash_fails_fast(repo):
 
 
 def test_env_sanitized(repo, tmp_path, monkeypatch):
-    dump = tmp_path / "env.json"
+    dump, extra = tmp_path / "env.json", tmp_path / "extra.json"
     (repo / "serving" / "__main__.py").write_text(
-        f"import json, os\nopen({str(dump)!r}, 'w').write(json.dumps(sorted(os.environ)))\n"
+        "import json, os\n"
+        f"open({str(dump)!r}, 'w').write(json.dumps(sorted(os.environ)))\n"
+        "try:\n    open('/proc/%d/environ' % os.getppid(), 'rb').read(); parent = 'readable'\n"
+        "except OSError:\n    parent = 'denied'\n"
+        f"open({str(extra)!r}, 'w').write(json.dumps({{'nice': os.nice(0), 'parent': parent}}))\n"
     )
+    base_nice = os.nice(0)
     monkeypatch.setenv("NEWS_SIGNAL_DATA", "/nowhere")
     monkeypatch.setenv("NEWS_SIGNAL_OTHER", "x")
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
@@ -147,6 +160,9 @@ def test_env_sanitized(repo, tmp_path, monkeypatch):
     names = json.loads(dump.read_text())
     assert not [n for n in names if n.startswith("NEWS_SIGNAL_")]
     assert "HF_HUB_OFFLINE" in names
+    seen = json.loads(extra.read_text())
+    assert seen["nice"] == min(19, base_nice + passrun.SERVING_NICE)  # serving runs at lower priority
+    assert seen["parent"] == "denied"  # the harness is not dumpable: its /proc files are closed to the child
 
 
 def test_prepare_failure_is_reported(repo):
@@ -181,6 +197,7 @@ def test_cpu_check_passes():
 # -- gates refuse invalid passes and bad counts ---------------------------------------------------------
 
 
+@settings(deadline=None)
 @given(
     ic=st.one_of(st.none(), st.floats(-0.2, 0.2)),
     missed=st.integers(0, 5), dup=st.integers(0, 5), invalid=st.integers(0, 2), valid=st.booleans(),
@@ -253,17 +270,19 @@ def _write(tmp_path, records) -> list[str]:
 
 def test_vs_output_records(tmp_path):
     gate = _gate()
-    ok = _check_stream(_write(tmp_path, bench.records_for(_score(), gate)))
+    ok = _check_stream(_write(tmp_path, bench.records_for(_score(), gate, DIRS)))
     assert ok["kind"] == "result" and ok["values"]["p99_latency_ms"] == 20.0
     for bad in (
         _score(missed=5), _score(duplicates=5), _score(invalid=1),
         _score(valid=False, invalid_reason="send lag p99 9.0 ms exceeds 5.0 ms"),
         _score(latency_ms={"p50": None, "p90": None, "p99": None, "max": None}, missed=1000, signaled=0),
     ):  # fmt: skip
-        err = _check_stream(_write(tmp_path, bench.records_for(bad, gate)))
+        err = _check_stream(_write(tmp_path, bench.records_for(bad, gate, DIRS)))
         assert err["kind"] == "error" and "error_kind" not in err
-    named = bench.records_for(_score(missed=5), gate)[-1]
+    named = bench.records_for(_score(missed=5), gate, DIRS)[-1]
     assert named["message"].startswith("missed 5") and named["partial"]["value"] == 20.0
+    invalid = bench.records_for(_score(valid=False, invalid_reason="send lag"), gate, DIRS)[-1]
+    assert "partial" not in invalid  # an invalid pass's p99 is not to be trusted
     req = bench.error_record("weights", requirement="no_weights_in_git")
     assert _check_stream(_write(tmp_path, [bench.HELLO, req]))["error_kind"] == "requirement_not_met"
 
@@ -280,7 +299,223 @@ def test_benchmark_main_turns_pass_error_into_record(tmp_path, monkeypatch):
     assert err["requirement"] == "infosys_unchanged" and err["error_kind"] == "requirement_not_met"
 
 
-# -- baseline freeze arithmetic -------------------------------------------------------------------------
+def test_benchmark_quality_gate():
+    gate = _gate()
+    assert bench.records_for(_score(), gate, {1})[-1]["message"].startswith("prediction quality")
+    low = bench.records_for(_score(ic=0.0, ic_se=0.01), gate, DIRS)[-1]
+    assert low["kind"] == "error" and "ic 0.0000" in low["message"] and low["partial"]["name"] == "p99_latency_ms"
+    assert bench.records_for(_score(ic=None), gate, DIRS)[-1]["kind"] == "error"
+    assert bench.records_for(_score(ic=0.05 - 2 * 0.01), gate, DIRS)[-1]["kind"] == "result"  # within 3 se
+    unfrozen = _gate(frozen=False)  # the baseline run that freezes bursts_ic
+    ok = bench.records_for(_score(ic=0.0), unfrozen, DIRS)[-1]
+    assert ok["kind"] == "result" and ok["values"]["ic"] == 0.0
+    assert bench.records_for(_score(), unfrozen, {0})[-1]["kind"] == "error"
+
+
+def test_benchmark_main_turns_any_exception_into_a_data_free_record(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("story text and /secret/path")
+
+    monkeypatch.setattr(bench, "run_pass", boom)
+    monkeypatch.setattr(bench, "load_gate", _gate)
+    out = tmp_path / "o.jsonl"
+    assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 1
+    err = _check_stream(out.read_text().splitlines())
+    assert "OSError" in err["message"] and "story text" not in err["message"] and "error_kind" not in err
+
+
+def test_checker_reports_bad_horizons_without_running(capsys):
+    assert checker.main(["--report", "--horizons", "5,x"]) == 1
+    assert "--horizons must be" in capsys.readouterr().out
+
+
+# -- failure paths of the pass runner -------------------------------------------------------------------
+
+
+def _fast_ready(monkeypatch, seconds=1.0):
+    smoke = passrun.SETTINGS[Mode.SMOKE]
+    monkeypatch.setitem(passrun.SETTINGS, Mode.SMOKE, dataclasses.replace(smoke, ready_timeout_s=seconds))
+
+
+def test_log_tail_is_bounded(repo):
+    (repo / "serving" / "__main__.py").write_text(
+        "import sys\nfor i in range(100):\n    print('x' * 5000)\nsys.exit(3)\n"
+    )
+    with pytest.raises(PassError) as e:
+        passrun.run_pass(Mode.SMOKE, "validation", root=repo, device="cpu")
+    lines = e.value.message.splitlines()
+    assert len(lines) <= passrun._LOG_TAIL_LINES and max(map(len, lines)) <= passrun._LOG_TAIL_CHARS + 100
+
+
+def test_serving_that_never_becomes_ready_times_out_with_its_log(repo, monkeypatch):
+    _fast_ready(monkeypatch)
+    (repo / "serving" / "__main__.py").write_text("import time\nprint('loading', flush=True)\ntime.sleep(600)\n")
+    with pytest.raises(PassError, match="never became ready.*loading"):
+        passrun.run_pass(Mode.SMOKE, "validation", root=repo, device="cpu")
+
+
+def test_serving_that_ignores_sigterm_is_killed(repo, tmp_path, monkeypatch):
+    _fast_ready(monkeypatch)
+    monkeypatch.setattr(passrun, "_STOP_GRACE_S", 0.5)
+    pidfile = tmp_path / "pid"
+    (repo / "serving" / "__main__.py").write_text(
+        "import os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\ntime.sleep(600)\n"
+    )
+    with pytest.raises(PassError):
+        passrun.run_pass(Mode.SMOKE, "validation", root=repo, device="cpu")
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pidfile.read_text()), 0)
+
+
+def test_prepare_timeout_is_reported(repo, monkeypatch):
+    monkeypatch.setattr(passrun, "PREPARE_TIMEOUT_S", 1)
+    (repo / "serving" / "prepare.py").write_text("import time\ntime.sleep(600)\n")
+    with pytest.raises(PassError, match="prepare exceeded 1 s"):
+        passrun.run_pass(Mode.SMOKE, "validation", root=repo, device="cpu")
+
+
+def test_store_that_is_not_the_pinned_one_is_refused():
+    fixture = ROOT / "infosys" / "fixtures" / "tiny"
+    with pytest.raises(PassError, match="does not match the pinned manifest"):  # the pending manifest pins nothing
+        passrun.run_pass(Mode.ACCURACY, "validation", data_dir=fixture, device="cpu")
+
+
+def test_repo_pin_edit_rejected(repo):
+    with (repo / "pyproject.toml").open("a") as f:
+        f.write("# edited\n")
+    with pytest.raises(PassError) as e:
+        passrun.run_pass(Mode.SMOKE, "validation", root=repo, device="cpu")
+    assert e.value.requirement == "infosys_unchanged"
+
+
+def test_symlink_out_of_the_tree_rejected(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    tree = tmp_path / "tree"
+    (tree / "serving").mkdir(parents=True)
+    (tree / "serving" / "w").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(PassError, match="symlink") as e:
+        passrun.check_candidate_files(tree)
+    assert e.value.requirement == "no_weights_in_git"
+
+
+# -- baseline freeze arithmetic and failure paths -------------------------------------------------------
+
+
+@pytest.fixture
+def freezer(repo, tmp_path):
+    for cmd in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]):
+        subprocess.run(["git", *cmd], cwd=repo, check=True, capture_output=True)
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("fz_copy", repo / "scripts" / "freeze_baseline.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    runs = tmp_path / "runs"
+    return module, module.Freezer(runs, set()), runs, repo
+
+
+def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03):
+    score = {"stories": 1000, "scored_pairs": 700, "ic": ic, "ic_se": 0.01, "missed": 0 if clean else 3,
+             "duplicates": 0, "invalid": 0, "valid": True}  # fmt: skip
+    (runs / "f1.json").write_text(json.dumps({"score": score}))
+    fz.stamp(runs / "f1.json")
+    for i, p99 in enumerate((100.0, 104.0), start=1):
+        values = {"p99_latency_ms": p99, "p50_latency_ms": 10.0, "stories": 300, "ic": bursts_ic}
+        rec = {"kind": "result", "label": "", "values": values}
+        (runs / f"bench-{i}.jsonl").write_text(json.dumps(bench.HELLO) + "\n" + json.dumps(rec) + "\n")
+        fz.stamp(runs / f"bench-{i}.jsonl")
+
+
+def test_freeze_rewrites_task_files_idempotently(freezer):
+    import tomllib
+
+    module, fz, runs, repo = freezer
+    _artifacts(fz, runs)
+    task = repo / ".vibesys" / "tasks" / "news-signal"
+
+    def freeze() -> dict:
+        fz.freeze()
+        return {n: (task / n).read_bytes() for n in ("gate.toml", "objectives.toml", "OBJECTIVE.md")}
+
+    first = freeze()
+    base = tomllib.loads(first["gate.toml"].decode())["baseline"]
+    assert base["frozen"] is True and base["ic_floor"] == 0.0212 and base["p99_ms"] == [100.0, 104.0]
+    assert base["bursts_ic"] == 0.03 and base["validation_stories"] == 1000 and base["scored_pairs"] == 700
+    assert b"PLACEHOLDER" not in first["gate.toml"]
+    assert tomllib.loads(first["objectives.toml"].decode())["pareto"]["relative_noise"] == 0.04
+    assert b"IC 0.04" in first["OBJECTIVE.md"] and b"Pending" not in first["OBJECTIVE.md"] and b"commit `" in first["OBJECTIVE.md"]
+    assert freeze() == first
+
+
+def test_freeze_refuses_null_ic_and_unclean_f1(freezer):
+    module, fz, runs, _ = freezer
+    _artifacts(fz, runs, ic=None)
+    with pytest.raises(SystemExit, match="not a finite number"):
+        fz.freeze()
+    _artifacts(fz, runs, clean=False)
+    with pytest.raises(SystemExit, match="never change the gate sample|Do not change the gate sample"):
+        fz.freeze()
+
+
+def test_stale_artifact_is_redone_and_missing_one_needs_the_cluster(freezer, monkeypatch):
+    module, fz, runs, repo = freezer
+    for name in ("NS_GPU_SSH", "NS_CAMP", "NS_SBATCH", "NS_PARTITION"):
+        monkeypatch.delenv(name, raising=False)
+    _artifacts(fz, runs)
+    assert not fz.todo("f1", runs / "f1.json")
+    module.set_toml(repo / ".vibesys" / "tasks" / "news-signal" / "gate.toml", "h_minutes", "15")
+    assert fz.todo("f1", runs / "f1.json")  # made at another H
+    with pytest.raises(SystemExit, match="is not set"):
+        fz.f1()
+
+
+def test_freeze_refuses_a_dirty_serving_tree(freezer):
+    _, fz, _, repo = freezer
+    (repo / "serving" / "model.py").write_text("# edited\n")
+    with pytest.raises(SystemExit, match="uncommitted"):
+        fz.sync()
+
+
+def test_freeze_job_resumes_and_does_not_mistake_a_failed_poll_for_done(freezer, monkeypatch):
+    module, fz, runs, _ = freezer
+    for name, val in (("NS_GPU_SSH", "host.example"), ("NS_CAMP", "/camp/dir"), ("NS_SBATCH", "sb"), ("NS_PARTITION", "p")):
+        monkeypatch.setenv(name, val)
+    calls, states = [], iter(["RUNNING", None, "RUNNING", "COMPLETED"])
+
+    def fake_ssh(script, *, input=None, tries=3):
+        calls.append(script.split()[0])
+        if script.startswith("sb "):
+            return "Submitted batch job 77\n"
+        if script.startswith("sacct"):
+            s = next(states)
+            return None if s is None else s + "\n"
+        if script.startswith("cat /camp"):
+            return "F1_DONE\nARTIFACT a.json\n"
+        return ""
+
+    monkeypatch.setattr(module, "ssh", fake_ssh)
+    monkeypatch.setattr(module, "sh", lambda cmd, **kw: (runs / "a.json").write_text("{}"))
+    monkeypatch.setattr(module.time, "sleep", lambda s: None)
+    log = fz.job("f1", "", "F1_DONE", "00:10:00")
+    assert "F1_DONE" in log and calls.count("sacct") == 4 and not (runs / "f1.jobid").exists()
+    # an interrupted wait resumes the recorded job instead of submitting again
+    (runs / "f1.jobid").write_text("77")
+    states = iter(["COMPLETED"])
+    calls.clear()
+    fz.job("f1", "", "F1_DONE", "00:10:00")
+    assert "sb" not in calls
+
+
+def test_freeze_job_rejects_a_reply_without_a_job_id_and_hides_the_host(freezer, monkeypatch, capsys):
+    module, fz, runs, _ = freezer
+    for name, val in (("NS_GPU_SSH", "host.example"), ("NS_CAMP", "/camp/dir"), ("NS_SBATCH", "sb"), ("NS_PARTITION", "p")):
+        monkeypatch.setenv(name, val)
+    monkeypatch.setattr(module, "ssh", lambda script, *, input=None, tries=3: "" if "cat >" in script else "error on host.example /camp/dir\n")
+    with pytest.raises(SystemExit) as e:
+        fz.job("f1", "", "F1_DONE", "00:10:00")
+    assert "no job id" in str(e.value) and "host.example" not in str(e.value) and "/camp/dir" not in str(e.value)
 
 
 def _load_freeze():
@@ -292,9 +527,10 @@ def _load_freeze():
     return module
 
 
+@settings(deadline=None)
 @given(ic=st.floats(-0.5, 0.5), se=st.floats(0, 0.1), a=st.floats(0.1, 1e4), b=st.floats(0.1, 1e4))
 def test_freeze_derivation(ic, se, a, b):
-    floor, noise = _load_freeze().derive(ic, se, a, b)
+    floor, noise = _FREEZE.derive(ic, se, a, b)
     assert floor <= ic - 2 * se + 1e-12 and ic - 2 * se - floor < 1.1e-4
     assert noise >= 0.03 and noise + 1e-9 >= abs(a - b) / ((a + b) / 2)
 
@@ -302,38 +538,9 @@ def test_freeze_derivation(ic, se, a, b):
 def test_freeze_set_toml_edits_only_the_named_section(tmp_path):
     path = tmp_path / "g.toml"
     path.write_text("ic = 1\n\n[baseline]\nic = 0.0\nfrozen = false\n")
-    freeze = _load_freeze()
-    freeze.set_toml(path, "ic", "0.25", section="baseline")
-    freeze.set_toml(path, "frozen", "true", section="baseline")
+    _FREEZE.set_toml(path, "ic", "0.25", section="baseline")
+    _FREEZE.set_toml(path, "frozen", "true", section="baseline")
     assert path.read_text() == "ic = 1\n\n[baseline]\nic = 0.25\nfrozen = true\n"
 
 
-def test_freeze_rewrites_task_files_idempotently(repo, tmp_path):
-    import tomllib
-
-    runs = tmp_path / "runs"
-    runs.mkdir()
-    score = {"stories": 1000, "scored_pairs": 700, "ic": 0.04125, "ic_se": 0.01, "missed": 0, "duplicates": 0,
-             "invalid": 0, "valid": True}  # fmt: skip
-    (runs / "f1.json").write_text(json.dumps({"score": score}))
-    for i, p99 in enumerate((100.0, 104.0), start=1):
-        values = {"p99_latency_ms": p99, "p50_latency_ms": 10.0, "stories": 300}
-        rec = {"kind": "result", "label": "", "values": values}
-        (runs / f"bench-{i}.jsonl").write_text(json.dumps(bench.HELLO) + "\n" + json.dumps(rec) + "\n")
-
-    def freeze() -> dict:
-        subprocess.run(
-            [sys.executable, str(repo / "scripts" / "freeze_baseline.py"), "--stages", "freeze"],
-            env={**os.environ, "NS_RUNS": str(runs)}, check=True, capture_output=True, timeout=BOUND_S,
-        )  # fmt: skip
-        task = repo / ".vibesys" / "tasks" / "news-signal"
-        return {n: (task / n).read_bytes() for n in ("gate.toml", "objectives.toml", "OBJECTIVE.md")}
-
-    first = freeze()
-    gate = tomllib.loads(first["gate.toml"].decode())
-    base = gate["baseline"]
-    assert base["frozen"] is True and base["ic_floor"] == 0.0212 and base["p99_ms"] == [100.0, 104.0]
-    assert base["validation_stories"] == 1000 and base["scored_pairs"] == 700
-    assert tomllib.loads(first["objectives.toml"].decode())["pareto"]["relative_noise"] == 0.04
-    assert b"IC 0.04" in first["OBJECTIVE.md"] and b"Pending" not in first["OBJECTIVE.md"]
-    assert freeze() == first
+_FREEZE = _load_freeze()

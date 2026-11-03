@@ -131,7 +131,7 @@ the end. `released` is the number of stories released on any feed so far; `total
 - **Latency** of a pair: `receipt - min over feeds of send`, where `send` is the instant newsd actually handed
   that story to the candidate on a feed: the instant it enters the subscriber's queue on a `ws` feed (so a
   candidate that stops reading gains nothing), the moment the message becomes pollable on a `poll` feed. Receipt is the first accepted signal for the pair. Both are on newsd's
-  clock. A pair never signaled counts as missed, with latency `end - min send` (`end` is the end of the drain).
+  clock. A pair never signaled counts as missed, with latency `end - min send` (`end` is the end of the drain). The drain lasts at most `drain_s` after the last release; it ends early, once every measured pair has a first signal and 5 s then pass with no accepted signal.
   A story never sent on any feed uses its scheduled instant (`release + feed delay`) instead.
 - **Invalid pass**: newsd also records, for every delivery of a measured story (warmup excluded), its lateness (actual send minus scheduled send).
   If the 99th percentile of that lateness exceeds 5 ms the server fell behind and the pass is marked

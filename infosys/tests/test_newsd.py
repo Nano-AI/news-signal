@@ -11,7 +11,7 @@ import aiohttp
 import numpy as np
 import pytest
 
-from infosys.newsd import PassLog, ReadyTimeout, ReceivedSignal, serve_pass
+from infosys.newsd import QUIET_S, PassLog, ReadyTimeout, ReceivedSignal, serve_pass
 from infosys.replay import FEEDS, FeedSpec, plan_pass
 from infosys.score import score_pass
 from infosys.store import Bars, Story
@@ -455,3 +455,81 @@ def test_send_lag_counts_measured_deliveries_only():
     n_measured = sum(d.story.story_id == measured.story_id for d in plan.deliveries)
     assert len(log.send_lag_ms) == n_measured < len(plan.deliveries)
     assert max(log.send_lag_ms) < 1000
+
+
+async def _released_all(session, url, n):
+    for _ in range(2000):  # hang guard: ~10 s
+        async with session.get(url + "/status") as r:
+            if (await r.json())["released"] == n:
+                return
+        await asyncio.sleep(0.005)
+    raise AssertionError("delivery never happened")
+
+
+def test_late_measured_delivery_still_counts_toward_send_lag():
+    plan, _, _ = _manual_plan()
+    clock = FakeClock()
+
+    async def main():
+        server = await Server(plan, clock=clock, drain_s=100).start()
+        async with aiohttp.ClientSession() as s:
+            async with s.post(server.url + "/ready"):
+                pass
+            clock.now = clock() + 1.0 + plan.last_s + 10  # every delivery is at least 10 s late
+            await _released_all(s, server.url, len(plan.measured))
+        clock.now += 1000
+        return await server.result()
+
+    log = _run(main())
+    assert len(log.send_lag_ms) == len(plan.deliveries) and min(log.send_lag_ms) >= 10_000 - 1e-6
+
+
+async def _drain_run(plan, clock, post_pairs):
+    """Delivers everything, posts `post_pairs`, then moves the fake clock; returns (server, t0, session)."""
+    server = await Server(plan, clock=clock, drain_s=100).start()
+    session = aiohttp.ClientSession()
+    async with session.post(server.url + "/ready"):
+        pass
+    t0 = clock() + 1.0
+    clock.now = t0 + plan.last_s
+    await _released_all(session, server.url, len(plan.measured))
+    for story_id, ticker in post_pairs:
+        status, body = await _post(session, server.url, [_signal(story_id, ticker)])
+        assert status == 200 and body["accepted"] == 1, body
+    clock.now = t0 + plan.last_s + QUIET_S + 0.5
+    return server, t0, session
+
+
+def test_drain_ends_early_once_every_pair_is_signalled_and_quiet():
+    plan, a, f = _manual_plan()
+    pairs = [(a.story_id, "AAA"), (a.story_id, "BBB"), (f.story_id, "AAA")]
+    clock = FakeClock()
+
+    async def main():
+        server, t0, session = await _drain_run(plan, clock, pairs)
+        try:
+            return await server.result(), t0
+        finally:
+            await session.close()
+
+    log, t0 = _run(main())
+    assert len(log.signals) == 3 and log.end_s < plan.last_s + 100  # the cap is 100 s past the last release
+    assert log.end_s <= plan.last_s + QUIET_S + 0.5 + 1e-6
+
+
+def test_drain_waits_to_the_cap_while_a_pair_is_missing():
+    plan, a, f = _manual_plan()
+    clock = FakeClock()
+
+    async def main():
+        server, t0, session = await _drain_run(plan, clock, [(a.story_id, "AAA"), (f.story_id, "AAA")])
+        try:
+            await asyncio.sleep(0.3)  # lets the drain loop run at the new clock
+            assert not server.task.done()
+            clock.now = t0 + plan.last_s + 100 + 1
+            return await server.result()
+        finally:
+            await session.close()
+
+    log = _run(main())
+    assert log.end_s == plan.last_s + 100

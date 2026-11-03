@@ -22,6 +22,7 @@ MAX_POLL_LIMIT = 500
 _SLEEP_CAP_S = 0.05
 SEND_TIMEOUT_S = 1.0  # a single ws send stuck this long disconnects the subscriber
 SUBSCRIBER_QUEUE_MAX = 1000  # undelivered messages per ws subscriber before it is disconnected
+QUIET_S = 5.0  # the pass ends early once every measured pair has a signal and this long passes with none
 _END_LINGER_S = 5.0  # guard: how long to wait for pollers to collect their end
 
 
@@ -107,6 +108,8 @@ class _Pass:
         self.senders: set[asyncio.Task] = set()
         self.ended: set[str] = set()
         self.ended_seen = asyncio.Event()
+        self.pending = {(s.story_id, t) for s in plan.measured for t in s.tickers}  # no first signal yet
+        self.last_signal_s = 0.0
         self.log = PassLog(0.0, [], {}, 0, [], plan.last_s)
 
     # -- state ---------------------------------------------------------------------------------
@@ -155,7 +158,7 @@ class _Pass:
         assert self.t0 is not None
         await self.sleep_until(d.at_s)
         story = d.story
-        if story.story_id in self.measured_ids:  # warmup is where the candidate cold-starts: its lateness is not the server falling behind
+        if story.story_id in self.measured_ids:  # warmup is where the candidate cold-starts: not the server falling behind
             self.log.send_lag_ms.append((self.clock() - (self.t0 + d.at_s)) * 1000)
         msg = StoryMessage(
             type="story",
@@ -186,7 +189,13 @@ class _Pass:
     async def run(self, drain_s: float) -> None:
         for d in self.plan.deliveries:
             await self.deliver(d)
-        await self.sleep_until(self.plan.last_s + drain_s)
+        self.last_signal_s = self.clock() - self.t0
+        deadline = self.plan.last_s + drain_s
+        while (now := self.clock() - self.t0) < deadline:
+            if not self.pending and now - self.last_signal_s >= QUIET_S:
+                self.log.end_s = now  # every pair is in and the line has gone quiet
+                break
+            await asyncio.sleep(min(max(deadline - now, 0.0005), _SLEEP_CAP_S))
         self.done = True
         async with self.new_data:
             self.new_data.notify_all()
@@ -311,6 +320,8 @@ class _Pass:
                 self.log.signals.append(
                     ReceivedSignal(sig.story_id, sig.ticker, sig.direction, sig.confidence, received)
                 )
+                self.pending.discard((sig.story_id, sig.ticker))
+                self.last_signal_s = received
         reply = SignalReply(accepted=len(batch.signals) - len(rejected), rejected=rejected)
         return web.json_response(reply.model_dump(mode="json"))
 

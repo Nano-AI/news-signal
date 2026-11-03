@@ -11,11 +11,11 @@ accelerator_backend = "rocm"
 
 # Prediction-quality gate: the replayed validation sample must keep the frozen baseline's IC (see gate.toml).
 [accuracy]
-command = ["uv", "run", "python", "${PROJECT_ROOT}/.vibesys/tasks/news-signal/accuracy_checker/checker.py"]
-timeout_seconds = 2400
+command = ["uv", "run", "--frozen", "python", "${PROJECT_ROOT}/.vibesys/tasks/news-signal/accuracy_checker/checker.py"]
+timeout_seconds = 3600
 
 # Burst-heavy replay. VibeSys appends `--vs-output <path>` and reads the result-protocol-v2 records.
 [benchmark]
-command = ["uv", "run", "python", "${PROJECT_ROOT}/.vibesys/tasks/news-signal/benchmark/run.py", "--mode", "bursts"]
-timeout_seconds = 1800
+command = ["uv", "run", "--frozen", "python", "${PROJECT_ROOT}/.vibesys/tasks/news-signal/benchmark/run.py", "--mode", "bursts"]
+timeout_seconds = 2400
 result_protocol = 2

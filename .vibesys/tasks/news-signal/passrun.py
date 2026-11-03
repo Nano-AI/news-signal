@@ -48,7 +48,10 @@ WEIGHT_SUFFIXES = frozenset({".safetensors", ".bin", ".pt", ".pth", ".onnx", ".g
 _EXCLUDED_TOP = frozenset({".git", ".venv", ".vibesys", "infosys"})
 _STOP_GRACE_S = 10.0
 _EXIT_GRACE_S = 10.0  # a clean exit just before newsd reports done is not a crash
-_LOG_TAIL_LINES = 40
+_LOG_TAIL_LINES = 20
+_LOG_TAIL_CHARS = 200  # per line: a log tail is the only text that flows back to the agent
+MAX_TREE_BYTES = 50 * 1024 * 1024
+SERVING_NICE = 10  # keeps the candidate's CPU threads from starving newsd's scheduler
 
 
 class Mode(StrEnum):
@@ -105,6 +108,7 @@ SETTINGS: dict[Mode, PassSettings] = {
 
 _GATE_KEYS = {
     "infosys_sha256": str,
+    "repo_sha256": str,
     "h_minutes": int,
     "h_reason": str,
     "max_missed_frac": float,
@@ -117,6 +121,7 @@ _BASELINE_KEYS = {
     "ic": float,
     "ic_se": float,
     "ic_floor": float,
+    "bursts_ic": float,
     "validation_stories": int,
     "scored_pairs": int,
     "p99_ms": list,
@@ -144,43 +149,69 @@ def load_gate() -> dict:
     return gate
 
 
-def infosys_digest(root: Path) -> str:
-    """sha256 over the sorted (relative path, bytes) of every file under `root/infosys`, caches excluded."""
-    base = root / "infosys"
-    files = sorted(
-        p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"
-    )
+_DIGEST_SKIP_NAMES = frozenset({"__pycache__", ".DS_Store", ".hypothesis", ".pytest_cache"})
+REPO_PINNED = ("pyproject.toml", "uv.lock", "docs/protocol.md")
+
+
+def _digest(base: Path, files: list[Path]) -> str:
     h = hashlib.sha256()
-    for path in files:
+    for path in sorted(files):
         data = path.read_bytes()
         h.update(path.relative_to(base).as_posix().encode() + b"\0" + str(len(data)).encode() + b"\0" + data)
     return h.hexdigest()
 
 
+def infosys_digest(root: Path) -> str:
+    """sha256 over the sorted (relative path, bytes) of every file under `root/infosys`, caches excluded."""
+    base = root / "infosys"
+    return _digest(
+        base,
+        [p for p in base.rglob("*") if p.is_file() and not _DIGEST_SKIP_NAMES & set(p.parts) and p.suffix != ".pyc"],
+    )
+
+
+def repo_digest(root: Path) -> str:
+    """sha256 over the dependency pins and the wire protocol; a missing file is its own digest."""
+    return _digest(root, [root / name for name in REPO_PINNED if (root / name).is_file()])
+
+
 def check_candidate_files(root: Path) -> None:
-    offenders = []
+    offenders, total = [], 0
+    real_root = root.resolve()
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         if here == root:
             dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_TOP]
+        for name in [*dirnames, *filenames]:
+            path = here / name
+            if path.is_symlink() and not path.resolve().is_relative_to(real_root):
+                offenders.append(f"{path.relative_to(root).as_posix()} (symlink outside the tree)")
         for name in filenames:
             path = here / name
             try:
                 size = path.stat().st_size
             except OSError:
                 continue
+            total += size
             if size > MAX_FILE_BYTES or path.suffix.lower() in WEIGHT_SUFFIXES:
                 offenders.append(path.relative_to(root).as_posix())
+    if not offenders and total > MAX_TREE_BYTES:
+        offenders.append(f"the tree is {total >> 20} MB, over {MAX_TREE_BYTES >> 20} MB")
     if offenders:
-        first = sorted(offenders)[0]
         raise PassError(
-            f"weights or large files must not be committed: {first}", requirement="no_weights_in_git"
+            f"weights, large files or links outside the tree must not be committed: {sorted(offenders)[0]}",
+            requirement="no_weights_in_git",
         )
 
 
 def _trust_infosys(root: Path, gate: dict) -> None:
     if infosys_digest(root) != gate["infosys_sha256"]:
         raise PassError("infosys/ differs from the digest pinned in gate.toml", requirement="infosys_unchanged")
+    if repo_digest(root) != gate["repo_sha256"]:
+        raise PassError(
+            "pyproject.toml, uv.lock or docs/protocol.md differ from the digest pinned in gate.toml",
+            requirement="infosys_unchanged",
+        )
     if "infosys" not in sys.modules and str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
@@ -199,7 +230,26 @@ def _tail(path: Path, lines: int = _LOG_TAIL_LINES) -> str:
         text = path.read_text(errors="replace")
     except OSError:
         return "(no log)"
-    return "\n".join(text.splitlines()[-lines:]) or "(empty log)"
+    tail = [line[:_LOG_TAIL_CHARS] for line in text.splitlines()[-lines:]]
+    return "\n".join(tail) or "(empty log)"
+
+
+def _serving_preexec() -> None:
+    """Runs in the serving child before exec: lower priority, and die with the harness (no orphan on the GPU)."""
+    os.nice(SERVING_NICE)
+    _libc().prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+
+
+def _libc():
+    import ctypes
+
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def _make_undumpable() -> None:
+    """PR_SET_DUMPABLE=0: the same-user serving child cannot read this process's /proc files (the store path)."""
+    if sys.platform.startswith("linux"):
+        _libc().prctl(4, 0)
 
 
 def _kill_group(pid: int, sig: signal.Signals) -> None:
@@ -246,6 +296,7 @@ async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, ma
     """Serve `plan` while racing the service process: its early exit fails the pass at once."""
     from infosys.newsd import ReadyTimeout, serve_pass
 
+    _make_undumpable()
     port = _free_port()
     procs: list[asyncio.subprocess.Process] = []
     started = asyncio.Event()
@@ -254,7 +305,8 @@ async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, ma
         with log.open("wb") as lf:
             procs.append(
                 await asyncio.create_subprocess_exec(
-                    *make_cmd(f"http://127.0.0.1:{port}"), cwd=root, env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True
+                    *make_cmd(f"http://127.0.0.1:{port}"), cwd=root, env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True,
+                    preexec_fn=_serving_preexec,
                 )
             )
         started.set()
@@ -338,6 +390,7 @@ def run_pass(
     gate = load_gate()
     _trust_infosys(root, gate)
     check_candidate_files(root)
+    _make_undumpable()
     from infosys.replay import plan_pass
     from infosys.score import score_pass
     from infosys.store import StoreMismatch, load_split, verify_store
@@ -390,14 +443,12 @@ def run_pass(
             log=tmp_dir / "serving.log",
         )
         # A full collection over the loaded stores would stall newsd's scheduler for ~100 ms (and fail the
-        # send-lag gate), so the heap is frozen and collection is off while the pass runs.
+        # send-lag gate), so the heap is frozen while the pass runs.
         gc.collect()
         gc.freeze()
-        gc.disable()
         try:
             log = asyncio.run(drive)
         finally:
-            gc.enable()
             gc.unfreeze()
     score = score_pass(plan, log, bars, horizon_min=gate["h_minutes"])
     return PassResult(plan, log, bars, score)
@@ -408,5 +459,9 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser()
     p.add_argument("--print-infosys-digest", action="store_true")
-    if p.parse_args().print_infosys_digest:
+    p.add_argument("--print-repo-digest", action="store_true")
+    a = p.parse_args()
+    if a.print_infosys_digest:
         print(infosys_digest(ROOT))
+    if a.print_repo_digest:
+        print(repo_digest(ROOT))
