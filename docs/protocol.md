@@ -28,6 +28,7 @@ posting before `POST /ready` is not one.
 | 404 | unknown feed name, a `ws` path on a `poll` feed (or the reverse), or an unknown path | `unknown feed: <name>` or `not found` |
 | 405 | wrong HTTP method for a known path | `method not allowed` |
 | 409 | `POST /signals` while state is `done` | `run finished` |
+| 413 | body of `POST /signals` is over 1 MiB | `request body too large` |
 | 422 | a poll query parameter is out of range or not an integer | `<param>: <reason>`, e.g. `wait_ms: must be 0..1000` |
 | 422 | a `SignalBatch` fails schema validation | `<path>: <reason>` for the first error, `<path>` dotted from the body root, e.g. `signals.0.price: extra forbidden`, `signals.0.direction: ...`, or `signals: ...` for a bad list length |
 
@@ -138,7 +139,7 @@ the end. `released` is the number of stories released on any feed so far; `total
   most 50 ms; otherwise it is marked invalid in the score (`valid: false`, the reason names each bound that
   failed with its value) and its latencies are not to be trusted. The score reports the p50, p90, p99 and max
   lateness. Systematic server lateness, which is what a CPU-starving candidate causes, moves p90, while rare
-  node stalls only move the tail: an idle GPU node showed intermittent 15-20 ms stalls with p90 under 1.5 ms.
+  node stalls only move the tail: an idle GPU node showed intermittent 15-20 ms stalls, while measured passes kept p90 around 1.5 ms.
   A stall bunches late stories, which makes the candidate's job harder, not easier, and latency is measured
   from the enqueue instant, so stalls never flatter the candidate.
 

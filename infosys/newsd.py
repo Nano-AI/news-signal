@@ -64,6 +64,8 @@ async def _json_errors(request: web.Request, handler: Callable) -> web.StreamRes
         return _error(404, "not found")
     except web.HTTPMethodNotAllowed:
         return _error(405, "method not allowed")
+    except web.HTTPRequestEntityTooLarge:
+        return _error(413, "request body too large")
 
 
 def _int_param(request: web.Request, name: str, default: int, lo: int, hi: int | None) -> int:

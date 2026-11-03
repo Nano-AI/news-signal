@@ -148,7 +148,7 @@ def plan_pass(
 
     deliveries: list[Delivery] = []
     for name, items in raw.items():
-        items.sort(key=lambda it: (it[0], it[1].published_at, it[1].story_id))
+        items.sort(key=lambda it: it[0])  # stable: ties keep release order, which is (published_at, story_id)
         deliveries += [Delivery(at, name, i, story) for i, (at, story) in enumerate(items, start=1)]
     deliveries.sort(key=lambda d: (d.at_s, d.feed, d.seq))
 
