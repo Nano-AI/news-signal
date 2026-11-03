@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from aiohttp import web
 
 from serving.service import run
@@ -90,13 +91,11 @@ def test_service_end_to_end():
 
 
 # ---- failure paths ----------------------------------------------------------------------------
-import pytest  # noqa: E402
-
-
 class Variant(FakeNewsd):
     def __init__(self, mode):
         super().__init__()
         self.mode = mode
+        self.posts = 0
 
     async def ws(self, req):
         if self.mode != "ws_drop":
@@ -111,6 +110,7 @@ class Variant(FakeNewsd):
         return ws
 
     async def on_signals(self, req):
+        self.posts += 1
         if self.mode in ("409", "500"):
             return web.json_response({"error": "x"}, status=int(self.mode))
         return await super().on_signals(req)
@@ -127,17 +127,21 @@ async def _failing(mode, classify):
         await asyncio.wait_for(run(f"http://127.0.0.1:{port}", classify), timeout=10)
     finally:
         await runner.cleanup()
+    return fake
 
 
 def _boom(h):
     raise KeyError("boom")
 
 
-@pytest.mark.parametrize("mode,exc", [("500", RuntimeError), ("ws_drop", RuntimeError), ("ok", KeyError)])
-def test_failures_raise(mode, exc):
-    with pytest.raises(exc):
+@pytest.mark.parametrize(
+    "mode,exc,msg",
+    [("500", RuntimeError, "500"), ("ws_drop", RuntimeError, "closed without end"), ("ok", KeyError, "boom")],
+)
+def test_failures_raise(mode, exc, msg):
+    with pytest.raises(exc, match=msg):
         asyncio.run(_failing(mode, _boom if mode == "ok" else (lambda h: FAKE[h])))
 
 
 def test_409_stops_cleanly():
-    asyncio.run(_failing("409", lambda h: FAKE[h]))
+    assert asyncio.run(_failing("409", lambda h: FAKE[h])).posts == 1
