@@ -126,6 +126,9 @@ class Freezer:
         say(f"bursts replay: {n} measured stories at budget_s=180")
         if n < 300:
             PASSRUN.write_text(re.sub(r"^BURSTS_BUDGET_S = .*$", "BURSTS_BUDGET_S = 240.0", PASSRUN.read_text(), flags=re.M))
+            note = f"# bursts window budget raised from 180 s to 240 s: {n} stories at 180 s (< 300)\n"
+            if note not in GATE.read_text():
+                GATE.write_text(GATE.read_text() + note)
             n = count()
             say(f"fewer than 300 stories: BURSTS_BUDGET_S raised to 240.0, now {n}")
             if n < 300:
