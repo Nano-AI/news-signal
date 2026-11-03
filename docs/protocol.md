@@ -128,9 +128,9 @@ the end. `released` is the number of stories released on any feed so far; `total
   `09:31 <= local(p)` and `local(p + H) <= 16:00`; the start price comes from a one-minute bar that ended at
   or before `p` and is at most 30 minutes old; the end price comes from a bar that ended in `(p, p + H]`.
   Otherwise the return is `null`. A bar's close is its price at the bar's end (start + 60 s).
-- **Latency** of a pair: `receipt - min over feeds of send`, where `send` is the instant newsd actually sent
-  that story to the candidate on a feed: just before the socket write on a `ws` feed, the moment the message
-  becomes pollable on a `poll` feed. Receipt is the first accepted signal for the pair. Both are on newsd's
+- **Latency** of a pair: `receipt - min over feeds of send`, where `send` is the instant newsd actually handed
+  that story to the candidate on a feed: the instant it enters the subscriber's queue on a `ws` feed (so a
+  candidate that stops reading gains nothing), the moment the message becomes pollable on a `poll` feed. Receipt is the first accepted signal for the pair. Both are on newsd's
   clock. A pair never signaled counts as missed, with latency `end - min send` (`end` is the end of the drain).
   A story never sent on any feed uses its scheduled instant (`release + feed delay`) instead.
 - **Invalid pass**: newsd also records, for every delivery, its lateness (actual send minus scheduled send).

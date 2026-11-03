@@ -2,16 +2,19 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import re
 import socket
 import time
 from datetime import UTC, datetime, timedelta
 
 import aiohttp
+import numpy as np
 import pytest
 
-from infosys.newsd import PassLog, ReadyTimeout, serve_pass
+from infosys.newsd import PassLog, ReadyTimeout, ReceivedSignal, serve_pass
 from infosys.replay import FEEDS, FeedSpec, plan_pass
-from infosys.store import Story
+from infosys.score import score_pass
+from infosys.store import Bars, Story
 
 BOUND_S = 10  # only guards against hangs
 BASE = datetime(2024, 3, 11, 14, 0, tzinfo=UTC)
@@ -341,25 +344,83 @@ def test_drain_accepts_signals_then_done_rejects_with_409():
     assert [x.story_id for x in log.signals] == ["s00"]
 
 
+def _big_plan(n=80, feeds=FAST_FEEDS[:1]):
+    big = "x" * 250_000  # n * 250 kB: far beyond what socket buffers hold for a reader that never reads
+    stories = [dataclasses.replace(_story(i, 0.02 * i), summary=big) for i in range(n)]
+    return stories, plan_pass(stories, [], gap_cap_s=0.02, seed=2, feeds=feeds, warmup_gap_s=0.0)
+
+
 def test_slow_subscriber_does_not_stall_other_subscribers():
-    big = "x" * 200_000  # 20 MB in all: far beyond what socket buffers hold for a reader that never reads
-    stories = [dataclasses.replace(_story(i, 0.01 * i), summary=big) for i in range(100)]
-    plan = plan_pass(stories, [], gap_cap_s=0.01, seed=2, feeds=FAST_FEEDS, warmup_gap_s=0.0)
+    stories, plan = _big_plan()
 
     async def main():
         server = await Server(plan, send_timeout_s=0.2, subscriber_queue_max=50).start()
-        received = []
+        received, stuck_frames = [], []
         async with aiohttp.ClientSession() as s:
             url = server.url + "/feeds/benzinga/ws"
-            fast, _stuck = await s.ws_connect(url), await s.ws_connect(url)  # the second is never read
+            fast, stuck = await s.ws_connect(url), await s.ws_connect(url)  # the second is never read
             async with s.post(server.url + "/ready"):
                 pass
-            async for frame in fast:
-                msg = json.loads(frame.data)
-                if msg["type"] == "end":
+            async for frame in fast:  # no JSON parsing: it would share the event loop with the scheduler
+                if frame.data.startswith('{"type": "end"'):
                     break
-                received.append(msg["story_id"])
-            await server.result()
-        return received
+                received.append(re.search(r'"story_id": "([^"]+)"', frame.data[:400]).group(1))
+            log = await server.result()
+            while True:  # whatever the stuck subscriber got before it was cut off
+                frame = await _bounded(stuck.receive())
+                if frame.type != aiohttp.WSMsgType.TEXT:
+                    break
+                stuck_frames.append(json.loads(frame.data))
+        return received, stuck_frames, log
 
-    assert sorted(_run(main())) == [s.story_id for s in stories]  # jitter may swap neighbours
+    received, stuck_frames, log = _run(main())
+    assert sorted(received) == [s.story_id for s in stories]  # jitter may swap neighbours
+    assert np.percentile(log.send_lag_ms, 99) < 5.0  # the stuck reader did not delay the scheduler
+    assert all(m["type"] == "story" for m in stuck_frames)  # disconnected: it never got the end
+    delivered = {m["story_id"] for m in stuck_frames}
+    assert len(delivered) < len(stories)
+    signals = [ReceivedSignal(i, "AAA", 1, 1.0, 5.0) for i in delivered]  # the stuck candidate signals what it saw
+    score = score_pass(plan, PassLog(0.0, signals, {}, 0, [], 100.0, log.sent_s), Bars({}), horizon_min=5)
+    assert score.missed == len(stories) - len(delivered) > 0
+
+
+def test_non_reading_candidate_cannot_lower_its_latency():
+    """Reading late must not move the stamps: they are taken when newsd hands the story over."""
+    stories, plan = _big_plan(60)
+
+    async def run(read_late: bool) -> PassLog:
+        clock = FakeClock()
+        t0 = clock() + 1.0
+        server = await Server(
+            plan, clock=clock, send_timeout_s=60, subscriber_queue_max=1000, drain_s=500.0
+        ).start()
+        async with aiohttp.ClientSession() as s:
+            ws = await s.ws_connect(server.url + "/feeds/benzinga/ws")
+
+            async def drain():
+                async for frame in ws:
+                    if json.loads(frame.data)["type"] == "end":
+                        return
+
+            reader = None if read_late else asyncio.create_task(drain())
+            async with s.post(server.url + "/ready"):
+                pass
+            for at in sorted(set(plan.available_s.values())):
+                clock.now = t0 + at
+                want = sum(a <= at for a in plan.available_s.values())
+                for _ in range(2000):  # hang guard
+                    async with s.get(server.url + "/status") as r:
+                        if (await r.json())["released"] >= want:
+                            break
+                    await asyncio.sleep(0.005)
+                else:
+                    raise AssertionError("delivery never happened")
+            clock.now = t0 + plan.last_s + 1000  # the candidate dawdles, then starts reading
+            await _bounded(reader or drain())
+            return await server.result()
+
+    reading, dawdling = _run(run(False)), _run(run(True))
+    assert dawdling.sent_s.keys() == reading.sent_s.keys() == plan.available_s.keys()
+    for story_id, scheduled in plan.available_s.items():
+        assert dawdling.sent_s[story_id] == pytest.approx(reading.sent_s[story_id], abs=1e-6)
+        assert dawdling.sent_s[story_id] == pytest.approx(scheduled, abs=1e-6)

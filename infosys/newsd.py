@@ -42,8 +42,8 @@ class PassLog:
     schema_errors: int
     send_lag_ms: list[float]  # actual - scheduled send instant, per delivery, in ms
     end_s: float
-    # story_id -> earliest actual send instant on any feed (seconds since t0), stamped just before the
-    # socket write (ws) or when the message becomes pollable (poll). Latency is measured from it.
+    # story_id -> earliest instant newsd handed the story to a subscriber's queue (ws) or made it pollable
+    # (poll), in seconds since t0. Latency is measured from it.
     sent_s: dict[str, float] = field(default_factory=dict)
 
 
@@ -142,8 +142,7 @@ class _Pass:
     async def _sender(self, feed: str, sub: _Sub) -> None:
         try:
             while (item := await sub.queue.get()) is not None:
-                story_id, text = item
-                self._stamp(story_id)
+                _, text = item
                 async with asyncio.timeout(self.send_timeout_s):
                     await sub.ws.send_str(text)
             async with asyncio.timeout(self.send_timeout_s):
@@ -174,6 +173,7 @@ class _Pass:
         for sub in list(self.subscribers[d.feed]):
             try:
                 sub.queue.put_nowait((story.story_id, text))
+                self._stamp(story.story_id)  # handed to the subscriber: its own backpressure cannot delay this
             except asyncio.QueueFull:
                 self._drop(d.feed, sub)
         if self.feeds[d.feed] == "poll":
