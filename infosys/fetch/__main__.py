@@ -21,16 +21,16 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     headers = alpaca.load_keys(args.env_file)
-    email = edgar.contact_email(args.contact_email)
+    email = edgar.contact_email(args.contact_email)  # EDGAR runs last so a block there cannot stop the Alpaca pull
     client = CachedClient(args.cache)
 
     def progress(label: str, pages: int) -> None:
         print(f"{label}: pages={pages} requests={client.network_requests} hits={client.cache_hits}", flush=True)
 
-    progress("edgar", edgar.fetch_8k(client, TICKERS, args.start, args.end, email))
     progress("news", alpaca.fetch_news(client, args.start, args.end, headers=headers))
     for ticker in TICKERS:
         progress(f"bars {ticker}", alpaca.fetch_bars(client, ticker, args.start, args.end, headers=headers))
+    progress("edgar", edgar.fetch_8k(client, TICKERS, args.start, args.end, email))
     print("fetch complete")
 
 

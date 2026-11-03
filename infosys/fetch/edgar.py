@@ -12,7 +12,7 @@ from infosys.fetch.http import CachedClient
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/"
 
-# TZ_RULE_PLACEHOLDER
+# UNVERIFIED (Step 5 blocked by SEC 403): rule to confirm is "acceptanceDateTime wall-clock is in this zone".
 ACCEPTANCE_TZ = "UTC"
 
 ITEM_TITLES: dict[str, str] = {
@@ -61,10 +61,10 @@ def contact_email(override: str | None) -> str:
     return email
 
 
-def acceptance_utc(acceptance: str) -> datetime:
-    """Convert a submissions `acceptanceDateTime` to UTC, reading its wall-clock part in ACCEPTANCE_TZ."""
+def acceptance_utc(acceptance: str, tz: str = ACCEPTANCE_TZ) -> datetime:
+    """Convert a submissions `acceptanceDateTime` to UTC, reading its wall-clock part in `tz`."""
     naive = datetime.fromisoformat(acceptance.removesuffix("Z")).replace(tzinfo=None, microsecond=0)
-    return naive.replace(tzinfo=ZoneInfo(ACCEPTANCE_TZ)).astimezone(UTC)
+    return naive.replace(tzinfo=ZoneInfo(tz)).astimezone(UTC)
 
 
 def fetch_8k(client: CachedClient, tickers: Sequence[str], start: date, end: date, email: str) -> int:

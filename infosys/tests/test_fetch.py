@@ -202,3 +202,16 @@ def test_edgar_user_agent_has_contact_and_is_not_cached(tmp_path):
 
 def test_contact_email_override():
     assert edgar.contact_email("a@b.test") == "a@b.test"
+
+
+@pytest.mark.parametrize(
+    ("stamp", "tz", "expected"),
+    [
+        ("2023-11-02T16:30:19.000Z", "UTC", "2023-11-02T16:30:19+00:00"),
+        ("2023-11-02T16:30:19.000Z", "America/New_York", "2023-11-02T20:30:19+00:00"),  # EDT
+        ("2024-01-10T16:30:19.000Z", "America/New_York", "2024-01-10T21:30:19+00:00"),  # EST
+    ],
+)
+def test_acceptance_conversion(stamp, tz, expected):
+    assert edgar.acceptance_utc(stamp, tz).isoformat() == expected
+    assert edgar.acceptance_utc(stamp, tz).tzinfo is not None
