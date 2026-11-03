@@ -26,5 +26,11 @@
     }
   },
   "fixture": "tiny",
-  "format": 1
+  "format": 1,
+  "tickers": [
+    "AAA",
+    "BBB",
+    "CCC",
+    "DDD"
+  ]
 }

@@ -1,1 +1,2 @@
-infosys/fixtures/tiny/* binary
+infosys/fixtures/tiny/*.npz binary
+infosys/fixtures/tiny/*.gz binary

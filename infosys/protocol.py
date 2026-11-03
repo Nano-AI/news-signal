@@ -1,11 +1,19 @@
 """Wire-protocol models. `docs/protocol.md` is the prose contract."""
 
+from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 Source = Literal["benzinga", "edgar"]
-Timestamp = Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")]
+
+
+def _real_timestamp(value: str) -> str:
+    datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")  # rejects impossible dates and times
+    return value
+
+
+Timestamp = Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"), AfterValidator(_real_timestamp)]
 
 
 class _Model(BaseModel):
@@ -57,7 +65,7 @@ class SignalBatch(_Model):
 
 class Rejection(_Model):
     index: int = Field(ge=0)
-    reason: Literal["unknown_story", "unknown_ticker", "not_yet_available"]
+    reason: Literal["not_yet_available", "unknown_ticker"]
 
 
 class SignalReply(_Model):
@@ -75,7 +83,13 @@ class TrainRecord(_Model):
     story_id: str
     source: Source
     published_at: Timestamp
-    tickers: list[str]
+    tickers: list[str] = Field(min_length=1, max_length=5)
     headline: str
     summary: str
     returns: dict[str, float | None]
+
+    @model_validator(mode="after")
+    def _returns_cover_tickers(self) -> "TrainRecord":
+        if set(self.returns) != set(self.tickers):
+            raise ValueError("returns keys must equal tickers")
+        return self

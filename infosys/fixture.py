@@ -23,7 +23,7 @@ _PLAN: dict[Split, tuple[list[date], int]] = {
     "validation": ([date(2023, 7, d) for d in range(10, 15)], 120),
     "holdout": ([date(2024, 7, d) for d in range(8, 11)], 60),
 }
-_TEMPLATES = {
+TEMPLATES = {
     1: ["{t} beats earnings estimates", "{t} raises full-year guidance", "{t} wins large contract"],
     -1: ["{t} misses earnings estimates", "{t} cuts full-year guidance", "{t} faces product recall"],
     0: ["{t} schedules investor day", "{t} names new board member", "{t} files routine report"],
@@ -52,7 +52,7 @@ def _stories(rng: random.Random, split: Split) -> tuple[list[Story], dict[str, i
         n_tickers = rng.choice([2, 3]) if i % 5 == 2 else 1
         tickers = tuple(sorted(rng.sample(TICKERS, n_tickers)))
         sign = rng.choice([1, -1, 0])
-        headline = rng.choice(_TEMPLATES[sign]).format(t=tickers[0])
+        headline = rng.choice(TEMPLATES[sign]).format(t=tickers[0])
         sid = f"{split[:2]}-{i:04d}"
         sign_of[sid] = sign
         stories.append(
@@ -103,7 +103,7 @@ def build_fixture(out: Path) -> None:
         stories_name, bars_name = store_files(split)
         write_stories(out / stories_name, stories)
         write_bars(out / bars_name, _bars(rng, split, stories, sign_of))
-    write_manifest(out, {"fixture": "tiny"})
+    write_manifest(out, {"fixture": "tiny", "tickers": list(TICKERS)})
 
 
 if __name__ == "__main__":

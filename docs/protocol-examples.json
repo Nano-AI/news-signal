@@ -1,9 +1,21 @@
 {
   "feeds": {
     "feeds": [
-      {"name": "benzinga-ws", "transport": "ws", "path": "/feeds/benzinga-ws/ws"},
-      {"name": "benzinga-poll", "transport": "poll", "path": "/feeds/benzinga-poll/poll"},
-      {"name": "edgar-poll", "transport": "poll", "path": "/feeds/edgar-poll/poll"}
+      {
+        "name": "benzinga-ws",
+        "transport": "ws",
+        "path": "/feeds/benzinga-ws/ws"
+      },
+      {
+        "name": "benzinga-poll",
+        "transport": "poll",
+        "path": "/feeds/benzinga-poll/poll"
+      },
+      {
+        "name": "edgar-poll",
+        "transport": "poll",
+        "path": "/feeds/edgar-poll/poll"
+      }
     ]
   },
   "story": {
@@ -13,11 +25,16 @@
     "story_id": "va-0007",
     "source": "benzinga",
     "published_at": "2023-07-10T14:31:05Z",
-    "tickers": ["AAA", "BBB"],
+    "tickers": [
+      "AAA",
+      "BBB"
+    ],
     "headline": "AAA beats earnings estimates",
     "summary": "AAA beats earnings estimates. Synthetic summary 7."
   },
-  "end": {"type": "end"},
+  "end": {
+    "type": "end"
+  },
   "poll": {
     "messages": [
       {
@@ -27,7 +44,9 @@
         "story_id": "va-0009",
         "source": "edgar",
         "published_at": "2023-07-10T21:05:00Z",
-        "tickers": ["CCC"],
+        "tickers": [
+          "CCC"
+        ],
         "headline": "CCC files routine report",
         "summary": "CCC files routine report. Synthetic summary 9."
       }
@@ -37,41 +56,114 @@
   },
   "signals": {
     "signals": [
-      {"story_id": "va-0007", "ticker": "AAA", "direction": 1, "confidence": 0.82},
-      {"story_id": "va-0007", "ticker": "BBB", "direction": -1, "confidence": 0.4},
-      {"story_id": "va-0009", "ticker": "CCC", "direction": 0, "confidence": 0.0}
+      {
+        "story_id": "va-0007",
+        "ticker": "AAA",
+        "direction": 1,
+        "confidence": 0.82
+      },
+      {
+        "story_id": "va-0007",
+        "ticker": "DDD",
+        "direction": -1,
+        "confidence": 0.4
+      },
+      {
+        "story_id": "va-0009",
+        "ticker": "CCC",
+        "direction": 0,
+        "confidence": 0.0
+      }
     ]
   },
   "signals_reply": {
     "accepted": 2,
-    "rejected": [{"index": 1, "reason": "unknown_ticker"}]
+    "rejected": [
+      {
+        "index": 1,
+        "reason": "unknown_ticker"
+      }
+    ]
   },
-  "status": {"state": "running", "released": 41, "total": 120},
+  "status": {
+    "state": "running",
+    "released": 41,
+    "total": 120
+  },
   "train_record": {
     "story_id": "tr-0001",
     "source": "benzinga",
     "published_at": "2023-06-05T15:02:11Z",
-    "tickers": ["AAA", "CCC"],
+    "tickers": [
+      "AAA",
+      "CCC"
+    ],
     "headline": "AAA raises full-year guidance",
     "summary": "AAA raises full-year guidance. Synthetic summary 1.",
-    "returns": {"AAA": 0.0031, "CCC": null}
+    "returns": {
+      "AAA": 0.0031,
+      "CCC": null
+    }
   },
   "invalid_signals": [
     {
       "key": "price",
-      "body": {"signals": [{"story_id": "va-0007", "ticker": "AAA", "direction": 1, "confidence": 0.5, "price": 101.2}]}
+      "body": {
+        "signals": [
+          {
+            "story_id": "va-0007",
+            "ticker": "AAA",
+            "direction": 1,
+            "confidence": 0.5,
+            "price": 101.2
+          }
+        ]
+      }
     },
     {
       "key": "direction",
-      "body": {"signals": [{"story_id": "va-0007", "ticker": "AAA", "direction": 2, "confidence": 0.5}]}
+      "body": {
+        "signals": [
+          {
+            "story_id": "va-0007",
+            "ticker": "AAA",
+            "direction": 2,
+            "confidence": 0.5
+          }
+        ]
+      }
     },
     {
       "key": "confidence",
-      "body": {"signals": [{"story_id": "va-0007", "ticker": "AAA", "direction": 1, "confidence": 1.5}]}
+      "body": {
+        "signals": [
+          {
+            "story_id": "va-0007",
+            "ticker": "AAA",
+            "direction": 1,
+            "confidence": 1.5
+          }
+        ]
+      }
     },
     {
       "key": "signals",
-      "body": {"signals": []}
+      "body": {
+        "signals": []
+      }
+    },
+    {
+      "key": "confidence",
+      "body": {
+        "signals": [
+          {
+            "story_id": "va-0007",
+            "ticker": "AAA",
+            "direction": 1,
+            "confidence": "0.5"
+          }
+        ]
+      }
     }
   ]
 }

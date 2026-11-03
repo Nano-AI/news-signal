@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import gzip
-import importlib
+import hashlib
 import json
 import math
 from collections.abc import Iterable, Mapping
@@ -51,8 +51,20 @@ def _gzip_write(path: Path, data: bytes) -> None:
         gz.write(data)
 
 
+def _check_utc(when: datetime, *, whole_seconds: bool = False) -> None:
+    if when.tzinfo is None:
+        raise ValueError("datetime must be timezone-aware")
+    if whole_seconds and when.microsecond:
+        raise ValueError(f"{when.isoformat()} is not a whole second")
+
+
 def write_stories(path: Path, stories: Iterable[Story]) -> int:
     ordered = sorted(stories, key=lambda s: (s.published_at, s.story_id))
+    for s in ordered:
+        _check_utc(s.published_at, whole_seconds=True)
+    ids = [s.story_id for s in ordered]
+    if len(set(ids)) != len(ids):
+        raise ValueError("duplicate story_id")
     lines = [
         json.dumps(
             {
@@ -98,6 +110,8 @@ def write_bars(path: Path, bars: Mapping[str, BarArrays]) -> int:
         t, o, c = np.asarray(t, np.int64), np.asarray(o, np.float64), np.asarray(c, np.float64)
         if not (len(t) == len(o) == len(c)):
             raise ValueError(f"{ticker}: bar arrays differ in length")
+        if not (np.all(np.isfinite(o)) and np.all(np.isfinite(c)) and np.all(o > 0) and np.all(c > 0)):
+            raise ValueError(f"{ticker}: bar prices must be finite and positive")
         if len(t) > 1 and not np.all(np.diff(t) > 0):
             raise ValueError(f"{ticker}: bar times are not sorted and unique")
         arrays[f"{ticker}.t"], arrays[f"{ticker}.o"], arrays[f"{ticker}.c"] = t, o, c
@@ -117,8 +131,9 @@ class Bars:
     def arrays(self, ticker: str) -> BarArrays:
         return self._data[ticker]
 
-    def close_before(self, ticker: str, t: datetime, max_lookback_s: int = 1800) -> float | None:
-        """Close of the latest bar that has ended by `t`; None if stale or unknown."""
+    def _bar_before(self, ticker: str, t: datetime, max_lookback_s: int) -> tuple[int, float] | None:
+        """(start, close) of the latest bar that has ended by `t`, or None if stale or unknown."""
+        _check_utc(t)
         if ticker not in self._data:
             return None
         times, _, closes = self._data[ticker]
@@ -126,18 +141,32 @@ class Bars:
         i = int(np.searchsorted(times, latest_start, side="right")) - 1
         if i < 0 or times[i] < latest_start - max_lookback_s:
             return None
-        return float(closes[i])
+        return int(times[i]), float(closes[i])
+
+    def close_before(self, ticker: str, t: datetime, max_lookback_s: int = 1800) -> float | None:
+        """Close of the latest bar that has ended by `t`; None if stale or unknown."""
+        bar = self._bar_before(ticker, t, max_lookback_s)
+        return None if bar is None else bar[1]
 
     def forward_return(self, ticker: str, published_at: datetime, horizon_min: int) -> float | None:
-        """Return over `horizon_min` minutes, only inside one regular New York session."""
-        p, q = published_at.astimezone(_NY), (published_at + timedelta(minutes=horizon_min)).astimezone(_NY)
+        """Return over `horizon_min` minutes inside one regular New York session, else None.
+
+        The start price is the close of a bar that ended at or before `published_at`, at most 30 minutes
+        old. The end price is the close of a bar that ended in (`published_at`, `published_at` + H]; if
+        none did (early close, data gap), the result is None rather than a stale price.
+        """
+        _check_utc(published_at)
+        if horizon_min <= 0:
+            raise ValueError("horizon_min must be positive")
+        end_at = published_at + timedelta(minutes=horizon_min)
+        p, q = published_at.astimezone(_NY), end_at.astimezone(_NY)
         if p.date() != q.date() or p.time() < time(9, 31) or q.time() > time(16, 0):
             return None
-        start = self.close_before(ticker, published_at)
-        end = self.close_before(ticker, published_at + timedelta(minutes=horizon_min))
-        if start is None or end is None:
+        start = self._bar_before(ticker, published_at, 1800)
+        end = self._bar_before(ticker, end_at, 1800)
+        if start is None or end is None or end[0] + 60 <= math.floor(published_at.timestamp()):
             return None
-        return end / start - 1
+        return end[1] / start[1] - 1
 
 
 def read_bars(path: Path) -> Bars:
@@ -155,17 +184,12 @@ def load_split(data_dir: Path, split: Split) -> tuple[list[Story], Bars]:
     return read_stories(data_dir / stories_name), read_bars(data_dir / bars_name)
 
 
-# The publish scan's deny list matches a fragment of this module's name, so the name is never written
-# literally in the repo. Other modules needing a digest call these helpers instead of importing it.
-_sha256 = importlib.import_module("hash" + "lib").sha256
-
-
 def sha256_bytes(data: bytes) -> str:
-    return _sha256(data).hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
-    h = _sha256()
+    h = hashlib.sha256()
     with path.open("rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
@@ -181,6 +205,11 @@ def _row_count(path: Path) -> int:
 
 
 def write_manifest(data_dir: Path, extra: Mapping[str, object]) -> dict:
+    """`extra` must carry `tickers`, the store's universe; it may not override `format` or `files`."""
+    if "tickers" not in extra:
+        raise ValueError("manifest extra must list the store's `tickers`")
+    if {"format", "files"} & set(extra):
+        raise ValueError("manifest extra may not set `format` or `files`")
     files = {}
     for split in SPLITS:
         for name in store_files(split):

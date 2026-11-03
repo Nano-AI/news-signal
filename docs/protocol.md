@@ -15,15 +15,29 @@ accepted where a number is expected).
 
 ## newsd HTTP API
 
-Base URL `http://127.0.0.1:<port>`. Errors are JSON `{"error": "<message>"}`. A 422 message names the
-offending parameter or key.
+Base URL `http://127.0.0.1:<port>`. For WebSocket, replace the scheme: `ws://127.0.0.1:<port>`.
+
+### Errors
+
+Every error is JSON `{"error": "<message>"}` with the status below. Nothing else is an error: polling or
+posting before `POST /ready` is not one.
+
+| status | when | message |
+| --- | --- | --- |
+| 400 | body of `POST /signals` is not valid JSON or not a JSON object | `malformed JSON body` |
+| 404 | unknown feed name, a `ws` path on a `poll` feed (or the reverse), or an unknown path | `unknown feed: <name>` or `not found` |
+| 405 | wrong HTTP method for a known path | `method not allowed` |
+| 409 | `POST /signals` while state is `done` | `run finished` |
+| 422 | a poll query parameter is out of range or not an integer | `<param>: <reason>`, e.g. `wait_ms: must be 0..1000` |
+| 422 | a `SignalBatch` fails schema validation | `<path>: <reason>` for the first error, `<path>` dotted from the body root, e.g. `signals.0.price: extra forbidden`, `signals.0.direction: ...`, or `signals: ...` for a bad list length |
 
 ### `GET /health` -> `{"ok": true}`
 
 ### `GET /feeds` -> `FeedList`
 
 `{"feeds": [FeedInfo]}` with `FeedInfo = {"name": str, "transport": "ws" | "poll", "path": str}`.
-`path` is relative to the base URL: `/feeds/{name}/ws` for `ws`, `/feeds/{name}/poll` for `poll`. Subscribe to
+`path` is relative to the base URL (use the `ws://` scheme for `ws`): `/feeds/{name}/ws` for `ws`,
+`/feeds/{name}/poll` for `poll`. Subscribe to
 every feed listed; names are not fixed.
 
 ### `GET /feeds/{name}/ws`
@@ -42,7 +56,7 @@ subscription before calling `POST /ready`. After `end`, the server closes the so
 | `story_id` | string | canonical |
 | `source` | `"benzinga"` or `"edgar"` | |
 | `published_at` | string | the story's publication time |
-| `tickers` | list of string | 1 to 5 entries, all from the universe |
+| `tickers` | list of string | 1 to 5 entries, from the replayed split's universe (see Universe) |
 | `headline` | string | |
 | `summary` | string | |
 
@@ -60,6 +74,8 @@ with different `seq` values. Messages released at the same instant keep a determ
   `wait_ms`, then returns an empty list.
 - `limit`: integer 1..500, default 100. Maximum messages per response.
 - `next`: the last seq returned, or `after` when the list is empty. Pass it as the next `after`.
+- Before `POST /ready` the response is empty with `next` = `after` and `end` false (the request still holds up
+  to `wait_ms`).
 - `end`: true once the feed has delivered everything and the response includes the final message (or none
   remain). When `end` is true the feed is finished; there is no `{"type": "end"}` message in poll feeds.
 - Any out-of-range or non-integer parameter gives 422 `{"error": "..."}` naming the parameter.
@@ -76,14 +92,15 @@ Body `SignalBatch`: `{"signals": [Signal]}` with 1 to 1024 items.
 `Signal`: `story_id` (string), `ticker` (string), `direction` (`-1`, `0` or `1`), `confidence` (finite float,
 `0 <= c <= 1`).
 
-A schema error (unknown key, wrong type, value out of range, 0 or more than 1024 items) gives 422 naming the
-key, and the whole batch is rejected. Otherwise the reply is 200 `SignalReply`:
+A schema error (unknown key, wrong type, value out of range, 0 or more than 1024 items) gives 422 (see
+Errors) and the whole batch is rejected. Otherwise the reply is 200 `SignalReply`:
 `{"accepted": int, "rejected": [{"index": int, "reason": ...}]}`. `index` is the item's position in the batch.
 Each item is checked in this order and gets the first reason that applies:
 
-1. `unknown_story`: `story_id` is not in the replayed split.
-2. `unknown_ticker`: `ticker` is not one of the story's tickers.
-3. `not_yet_available`: no feed has made the story available yet.
+1. `not_yet_available`: the story has not been made available on any feed yet, or `story_id` is not in the
+   replayed split. The two cases are deliberately indistinguishable, so a candidate cannot probe for future
+   stories. Before `POST /ready` every item gets this reason.
+2. `unknown_ticker`: the story is available but `ticker` is not one of its tickers.
 
 `accepted` counts items without a rejection, including duplicates (a duplicate is accepted but scored as a
 duplicate). The first signal for a `(story_id, ticker)` pair counts; later ones are duplicates.
@@ -94,6 +111,23 @@ duplicate). The first signal for a `(story_id, ticker)` pair counts; later ones 
 `waiting` is before `POST /ready`; `warmup` is after it, before the first story is released; `running`
 releases stories; `draining` is after the last release, while late signals are still accepted; `done` is
 the end. `released` is the number of stories released on any feed so far; `total` is the split's story count.
+
+## Universe, horizon and labels
+
+- **Universe**: the store's tickers are listed in its `manifest.json` under `tickers`. The real store uses the
+  25 tickers of `infosys.universe.TICKERS`; the synthetic fixture uses `AAA BBB CCC DDD`. A story's `tickers`
+  are a subset of the replayed store's universe. newsd checks signal tickers against the story's own
+  `tickers`, never against a built-in list, and the candidate must not hard-code a universe either.
+- **Horizon H**: 5 minutes. Forward return of a pair is
+  `close(p + H) / close(p) - 1`, with `p` the story's `published_at`, both prices raw (unadjusted), from one
+  regular session.
+- **Labels**: the return is defined only when `p` and `p + H` fall on the same New York date with
+  `09:31 <= local(p)` and `local(p + H) <= 16:00`; the start price comes from a one-minute bar that ended at
+  or before `p` and is at most 30 minutes old; the end price comes from a bar that ended in `(p, p + H]`.
+  Otherwise the return is `null`. A bar's close is its price at the bar's end (start + 60 s).
+- **Latency** of a pair: `receipt - min over feeds of (release + feed delay)`, where `release` is the story's
+  scheduled release instant on the (compressed) replay schedule and `feed delay` is that feed's own seeded
+  delay (0 or more). Receipt is the first accepted signal for the pair.
 
 ## Semantics
 
@@ -112,7 +146,8 @@ python -m serving --newsd URL --model MODEL --device {cuda,cpu} --prepared DIR
 ```
 
 - `serving.prepare`: `FILE` is gzip JSON lines of `TrainRecord`, the latest at most 50,000 train stories.
-  `returns` holds the forward return at the gate's horizon per ticker, or `null` when it is not defined.
+  `returns` holds the forward return at H (see Labels) per ticker, or `null` when it is not defined; its keys
+  equal `tickers`. Lines are in ascending `(published_at, story_id)` order, so "latest" means the tail.
   `TrainRecord = {story_id, source, published_at, tickers, headline, summary, returns: {ticker: float | null}}`.
   Time limit 1200 s. `DIR` receives whatever the service needs later.
 - `serving` (the service): `URL` is the newsd base URL. It subscribes to every feed, posts signals, and exits
