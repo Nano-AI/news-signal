@@ -5,7 +5,7 @@ import pytest
 
 from infosys.newsd import PassLog, ReceivedSignal
 from infosys.replay import ReplayPlan
-from infosys.score import score_pass
+from infosys.score import MAX_SEND_LAG_P90_MS, MAX_SEND_LAG_P99_MS, score_pass
 from infosys.store import Bars, Story
 
 P = datetime(2024, 3, 11, 14, 0, tzinfo=UTC)  # 10:00 EDT
@@ -53,7 +53,7 @@ def test_latency_missed_duplicates():
     assert score.latency_ms["p99"] == np.percentile(expected, 99)
     assert score.latency_ms["p50"] == np.percentile(expected, 50)
     assert score.throughput_per_s == 2 / (2.5 - 1.0)
-    assert score.send_lag_p99_ms == np.percentile([1.0, 2.0], 99)
+    assert score.send_lag_ms == pytest.approx({"p50": 1.5, "p90": 1.9, "p99": 1.99, "max": 2.0})
 
 
 def test_invalid_counts_rejections_and_schema_errors():
@@ -113,10 +113,45 @@ def test_no_pairs_reports_null_percentiles():
     assert score.latency_ms == {"p50": None, "p90": None, "p99": None, "max": None}
 
 
-def test_pass_invalid_when_server_lagged():
+def _lagged(fractions: dict[float, float], n: int = 1000):
+    """Score a pass whose deliveries are `fraction` late by `ms`, the rest 0.1 ms late."""
+    lag = [0.1] * n
+    at = 0
+    for ms, frac in fractions.items():
+        k = round(n * frac)
+        lag[at : at + k] = [ms] * k
+        at += k
     plan = _plan([_story(1)], [1.0])
-    ok = score_pass(plan, _log([_sig("s1")]), _bars({}), horizon_min=5)
+    return score_pass(plan, PassLog(0.0, [_sig("s1")], {}, 0, lag, 100.0), _bars({}), horizon_min=5)
+
+
+def test_pass_valid_without_lag():
+    ok = score_pass(_plan([_story(1)], [1.0]), _log([_sig("s1")]), _bars({}), horizon_min=5)
     assert ok.valid and ok.invalid_reason is None
-    late = PassLog(0.0, [_sig("s1")], {}, 0, [0.1] * 90 + [50.0] * 10, 100.0)
-    bad = score_pass(plan, late, _bars({}), horizon_min=5)
-    assert not bad.valid and "send lag" in bad.invalid_reason
+
+
+def test_rare_stalls_do_not_invalidate():
+    score = _lagged({20.0: 0.02})  # 2% of deliveries 20 ms late: p90 small, p99 20 ms
+    assert score.valid and score.send_lag_ms["p99"] == 20.0 and score.send_lag_ms["max"] == 20.0
+
+
+def test_systematic_lateness_is_invalid_on_p90():
+    score = _lagged({8.0: 0.15})
+    assert not score.valid and "p90 8.0 ms exceeds 5.0" in score.invalid_reason and "p99" not in score.invalid_reason
+
+
+def test_long_tail_is_invalid_on_p99():
+    score = _lagged({60.0: 0.02})
+    assert not score.valid and "p99 60.0 ms exceeds 50.0" in score.invalid_reason and "p90" not in score.invalid_reason
+
+
+def test_bounds_are_inclusive_and_both_named():
+    assert _lagged({MAX_SEND_LAG_P99_MS: 0.02}).valid
+    both = _lagged({60.0: 0.2})
+    assert "p90" in both.invalid_reason and "p99" in both.invalid_reason
+    assert MAX_SEND_LAG_P90_MS == 5.0
+
+
+def test_send_lag_fields_are_in_the_score():
+    fields = _lagged({}).send_lag_ms
+    assert set(fields) == {"p50", "p90", "p99", "max"}

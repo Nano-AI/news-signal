@@ -131,11 +131,16 @@ the end. `released` is the number of stories released on any feed so far; `total
 - **Latency** of a pair: `receipt - min over feeds of send`, where `send` is the instant newsd actually handed
   that story to the candidate on a feed: the instant it enters the subscriber's queue on a `ws` feed (so a
   candidate that stops reading gains nothing), the moment the message becomes pollable on a `poll` feed. Receipt is the first accepted signal for the pair. Both are on newsd's
-  clock. A pair never signaled counts as missed, with latency `end - min send` (`end` is the end of the drain).
+  clock. A pair never signaled counts as missed, with latency `end - min send` (`end` is the end of the drain). The drain lasts at most `drain_s` after the last release; it ends early, once every measured pair has a first signal and 5 s then pass with no accepted signal. After the end, `POST /signals` gets 409 and nothing is counted: duplicate or invalid signals sent after the end are not scored, so a service must send every signal it intends to send while the pass is running.
   A story never sent on any feed uses its scheduled instant (`release + feed delay`) instead.
-- **Invalid pass**: newsd also records, for every delivery, its lateness (actual send minus scheduled send).
-  If the 99th percentile of that lateness exceeds 5 ms the server fell behind and the pass is marked
-  invalid in the score (`valid: false` with a reason); its latencies are not to be trusted.
+- **Invalid pass**: newsd also records, for every delivery of a measured story (warmup excluded), its lateness (actual send minus scheduled send).
+  The pass is valid if and only if the 90th percentile of that lateness is at most 5 ms and the 99th is at
+  most 50 ms; otherwise it is marked invalid in the score (`valid: false`, the reason names each bound that
+  failed with its value) and its latencies are not to be trusted. The score reports the p50, p90, p99 and max
+  lateness. Systematic server lateness, which is what a CPU-starving candidate causes, moves p90, while rare
+  node stalls only move the tail: an idle GPU node showed intermittent 15-20 ms stalls with p90 under 1.5 ms.
+  A stall bunches late stories, which makes the candidate's job harder, not easier, and latency is measured
+  from the enqueue instant, so stalls never flatter the candidate.
 
 ## Semantics
 

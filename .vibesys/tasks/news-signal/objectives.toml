@@ -1,0 +1,12 @@
+# Latency on the burst replay. Both are required metrics declared by benchmark/run.py.
+[[objective]]
+name = "p99_latency_ms"
+direction = "min"
+
+[[objective]]
+name = "p50_latency_ms"
+direction = "min"
+
+[pareto]
+# PLACEHOLDER until the baseline is frozen: scripts/freeze_baseline.py sets it from the two baseline runs.
+relative_noise = 0.03
