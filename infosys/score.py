@@ -12,6 +12,7 @@ from infosys.replay import ReplayPlan
 from infosys.store import Bars
 
 MIN_IC_PAIRS = 30
+MAX_SEND_LAG_P99_MS = 5.0  # above this the server fell behind and latencies are not trustworthy
 
 
 @dataclass(frozen=True)
@@ -22,13 +23,15 @@ class PassScore:
     missed: int
     duplicates: int
     invalid: int
-    latency_ms: dict[str, float]
+    latency_ms: dict[str, float | None]  # None when there are no pairs
     throughput_per_s: float
     scored_pairs: int
     ic: float | None
     ic_se: float | None
     hit_rate: float | None
     send_lag_p99_ms: float
+    valid: bool = True
+    invalid_reason: str | None = None
 
 
 def _ic(x: np.ndarray, y: np.ndarray) -> float | None:
@@ -38,9 +41,9 @@ def _ic(x: np.ndarray, y: np.ndarray) -> float | None:
     return None if np.isnan(r) else r
 
 
-def _percentiles(values: list[float]) -> dict[str, float]:
+def _percentiles(values: list[float]) -> dict[str, float | None]:
     if not values:
-        return {"p50": 0.0, "p90": 0.0, "p99": 0.0, "max": 0.0}
+        return {"p50": None, "p90": None, "p99": None, "max": None}
     p50, p90, p99 = (float(np.percentile(values, q)) for q in (50, 90, 99))
     return {"p50": p50, "p90": p90, "p99": p99, "max": float(max(values))}
 
@@ -67,7 +70,7 @@ def score_pass(
     ys: list[list[float]] = []  # and forward return
     directions: list[int] = []
     for story in plan.measured:
-        avail = plan.available_s[story.story_id]
+        avail = log.sent_s.get(story.story_id, plan.available_s[story.story_id])  # actual send, else scheduled
         sx, sy = [], []
         for ticker in story.tickers:
             pairs += 1
@@ -109,11 +112,13 @@ def score_pass(
             ic_se = float(np.std(samples, ddof=1))
 
     span = (
-        max(s.received_s for s in first.values()) - min(plan.available_s[s.story_id] for s in plan.measured)
+        max(s.received_s for s in first.values()) - min(log.sent_s.get(s.story_id, plan.available_s[s.story_id]) for s in plan.measured)
         if first
         else 0.0
     )
     lag = log.send_lag_ms
+    lag_p99 = float(np.percentile(lag, 99)) if lag else 0.0
+    reason = f"send lag p99 {lag_p99:.1f} ms exceeds {MAX_SEND_LAG_P99_MS} ms" if lag_p99 > MAX_SEND_LAG_P99_MS else None
     return PassScore(
         stories=len(plan.measured),
         pairs=pairs,
@@ -127,5 +132,7 @@ def score_pass(
         ic=ic,
         ic_se=ic_se,
         hit_rate=hit_rate,
-        send_lag_p99_ms=float(np.percentile(lag, 99)) if lag else 0.0,
+        send_lag_p99_ms=lag_p99,
+        valid=reason is None,
+        invalid_reason=reason,
     )

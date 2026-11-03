@@ -13,7 +13,7 @@ P = datetime(2024, 3, 11, 14, 0, tzinfo=UTC)  # 10:00 EDT
 
 def _plan(stories: list[Story], available: list[float], warmup: tuple[Story, ...] = ()) -> ReplayPlan:
     stamps = {s.story_id: a for s, a in zip([*warmup, *stories], [*([0.0] * len(warmup)), *available], strict=True)}
-    return ReplayPlan((), tuple(stories), frozenset(s.story_id for s in warmup), stamps, stamps, max(stamps.values()))
+    return ReplayPlan((), tuple(stories), frozenset(s.story_id for s in warmup), stamps, stamps, max(stamps.values(), default=0.0))
 
 
 def _log(signals: list[ReceivedSignal], end_s: float = 100.0) -> PassLog:
@@ -99,3 +99,24 @@ def test_warmup_excluded():
     score = score_pass(plan, log, _bars({}), horizon_min=5)
     assert (score.stories, score.pairs, score.signaled, score.duplicates) == (1, 1, 1, 0)
     assert score.latency_ms["max"] == 500
+
+
+def test_latency_runs_from_actual_send():
+    plan = _plan([_story(1)], [1.0])
+    log = _log([_sig("s1", received=1.25)])
+    log.sent_s["s1"] = 1.2
+    assert score_pass(plan, log, _bars({}), horizon_min=5).latency_ms["p50"] == pytest.approx(50)
+
+
+def test_no_pairs_reports_null_percentiles():
+    score = score_pass(_plan([], []), _log([]), _bars({}), horizon_min=5)
+    assert score.latency_ms == {"p50": None, "p90": None, "p99": None, "max": None}
+
+
+def test_pass_invalid_when_server_lagged():
+    plan = _plan([_story(1)], [1.0])
+    ok = score_pass(plan, _log([_sig("s1")]), _bars({}), horizon_min=5)
+    assert ok.valid and ok.invalid_reason is None
+    late = PassLog(0.0, [_sig("s1")], {}, 0, [0.1] * 90 + [50.0] * 10, 100.0)
+    bad = score_pass(plan, late, _bars({}), horizon_min=5)
+    assert not bad.valid and "send lag" in bad.invalid_reason

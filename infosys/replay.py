@@ -122,21 +122,29 @@ def plan_pass(
 ) -> ReplayPlan:
     """Schedule warmup stories at a fixed rate, then the measured ones compressed, on every feed.
 
-    Warmup ends one slot after its last story (`len(warmup) / warmup_rate_hz`).
+    The measured window starts `warmup_gap_s` after the last warmup delivery on any feed.
     """
     measured = sorted(measured, key=_order)
     warmup = sorted(warmup, key=_order)
     if {s.story_id for s in measured} & {s.story_id for s in warmup}:
         raise ValueError("a story is in both the measured and the warmup set")
     release: dict[str, float] = {s.story_id: i / warmup_rate_hz for i, s in enumerate(warmup)}
-    start = len(warmup) / warmup_rate_hz + warmup_gap_s
-    release.update({s.story_id: start + r for s, r in zip(measured, compress(measured, gap_cap_s), strict=True)})
-
     raw: dict[str, list[tuple[float, Story]]] = {f.name: [] for f in feeds}
-    for story in [*warmup, *measured]:
-        for feed in feeds:
-            if story.source in feed.sources:
-                raw[feed.name] += _feed_deliveries(feed, story, release[story.story_id], seed)
+
+    def schedule(stories: Sequence[Story]) -> float:
+        last = 0.0
+        for story in stories:
+            for feed in feeds:
+                if story.source in feed.sources:
+                    items = _feed_deliveries(feed, story, release[story.story_id], seed)
+                    raw[feed.name] += items
+                    last = max([last, *(at for at, _ in items)])
+        return last
+
+    warmup_last = schedule(warmup)  # the last warmup copy, so no warmup delivery lands in the measured window
+    start = max(len(warmup) / warmup_rate_hz, warmup_last) + warmup_gap_s
+    release.update({s.story_id: start + r for s, r in zip(measured, compress(measured, gap_cap_s), strict=True)})
+    schedule(measured)
 
     deliveries: list[Delivery] = []
     for name, items in raw.items():

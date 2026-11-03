@@ -43,14 +43,14 @@ async def _bounded(coro):
 class Server:
     """Runs serve_pass in a task; `start` returns once it listens (and `on_listening` has finished)."""
 
-    def __init__(self, plan, *, on_listening=None, drain_s=0.05, ready_timeout_s=BOUND_S, clock=time.monotonic):
+    def __init__(self, plan, *, on_listening=None, drain_s=0.05, ready_timeout_s=BOUND_S, clock=time.monotonic, **serve_kwargs):
         self.port, self.listening = _free_port(), asyncio.Event()
         self.url = f"http://127.0.0.1:{self.port}"
 
         async def hook():
-            self.listening.set()
             if on_listening is not None:
                 await on_listening(self)
+            self.listening.set()
 
         self.task = asyncio.create_task(
             serve_pass(
@@ -60,6 +60,7 @@ class Server:
                 drain_s=drain_s,
                 on_listening=hook,
                 clock=clock,
+                **serve_kwargs,
             )
         )
 
@@ -90,15 +91,17 @@ async def _post(session, url, signals, path="/signals"):
 
 
 def test_pass_end_to_end_never_early():
+    """Steps a fake clock across every release: nothing is visible before its instant, all of it after."""
     stories = [_story(i, i * 0.5, "edgar" if i % 3 == 0 else "benzinga", ("AAA", "BBB")[: 1 + i % 2]) for i in range(8)]
     plan = plan_pass(
         stories[2:], stories[:2], gap_cap_s=0.05, seed=4, feeds=FAST_FEEDS, warmup_rate_hz=100, warmup_gap_s=0.05
     )
+    clock = FakeClock()
     first_seen: dict[str, float] = {}
     posted: set[tuple[str, str]] = set()
 
     async def sight(session, url, msg):
-        first_seen.setdefault(msg["story_id"], time.monotonic())
+        first_seen.setdefault(msg["story_id"], clock())
         for ticker in msg["tickers"]:
             if (msg["story_id"], ticker) not in posted:
                 posted.add((msg["story_id"], ticker))
@@ -126,9 +129,14 @@ def test_pass_end_to_end_never_early():
             if body["end"]:
                 return
 
+    async def released(session, url) -> int:
+        async with session.get(url + "/status") as r:
+            return (await r.json())["released"]
+
     async def main():
         readers: list[asyncio.Task] = []
         session = aiohttp.ClientSession()
+        t0 = clock() + 1.0
 
         async def subscribe(server):
             async with session.get(server.url + "/feeds") as r:
@@ -142,22 +150,38 @@ def test_pass_end_to_end_never_early():
             async with session.post(server.url + "/ready") as r:
                 assert (await r.json()) == {"ok": True}
 
-        server = Server(plan, on_listening=subscribe, drain_s=0.1)
+        server = Server(plan, on_listening=subscribe, drain_s=0.1, clock=clock)
         try:
+            await server.start()
+            measured = {s.story_id for s in plan.measured}
+            for at in sorted({plan.available_s[i] for i in measured}):
+                before = sum(plan.available_s[i] < at for i in measured)
+                clock.now = t0 + at - 0.001
+                await asyncio.sleep(0.05)  # lets an early delivery happen if the scheduler were wrong
+                assert await released(session, server.url) == before
+                clock.now = t0 + at
+                for _ in range(2000):  # hang guard: ~10 s
+                    if await released(session, server.url) > before:
+                        break
+                    await asyncio.sleep(0.005)
+                else:
+                    raise AssertionError("delivery never happened")
+            clock.now = t0 + plan.last_s + 1.0
             log = await server.result()
             await _bounded(asyncio.gather(*readers))
         finally:
             await session.close()
             await server.stop()
-        return log
+        return log, t0
 
-    log = _run(main())
+    log, t0 = _run(main())
     pairs = {(s.story_id, t) for s in stories for t in s.tickers}
     assert {(s.story_id, s.ticker) for s in log.signals} == pairs
     assert len(log.signals) == len(pairs)
-    assert log.invalid == {} and log.schema_errors == 0
+    assert log.invalid == {} and log.schema_errors == 0 and log.t0 == t0
     for story in stories:
-        assert first_seen[story.story_id] - log.t0 >= plan.available_s[story.story_id] - 0.001
+        assert first_seen[story.story_id] - t0 >= plan.available_s[story.story_id] - 1e-9
+        assert log.sent_s[story.story_id] >= plan.available_s[story.story_id] - 1e-9
 
 
 def _manual_plan():
@@ -281,3 +305,61 @@ def test_end_broadcast():
     assert [m["type"] for m in frames] == ["story", "end"]
     assert polls[-1] == {"messages": [], "next": 0, "end": True}
     assert not any(p["end"] for p in polls[:-1])
+
+
+def test_drain_accepts_signals_then_done_rejects_with_409():
+    plan, _, _ = _manual_plan()
+    clock = FakeClock()
+
+    async def status(s, url):
+        async with s.get(url + "/status") as r:
+            return await r.json()
+
+    async def main():
+        server = await Server(plan, clock=clock, drain_s=100.0).start()
+        async with aiohttp.ClientSession() as s:
+            async with s.post(server.url + "/ready"):
+                pass
+            async with s.get(server.url + "/feeds/edgar/poll"):  # a polled feed keeps the server up after done
+                pass
+            assert (await status(s, server.url))["state"] == "warmup"
+            clock.now += 1.0 + plan.last_s + 1.0  # past the last release, inside the drain
+            assert (await status(s, server.url))["state"] == "draining"
+            assert (await status(s, server.url))["total"] == 2
+            assert await _post(s, server.url, [_signal()]) == (200, {"accepted": 1, "rejected": []})
+            clock.now += 1000
+            for _ in range(2000):  # hang guard
+                if (await status(s, server.url))["state"] == "done":
+                    break
+                await asyncio.sleep(0.005)
+            assert await _post(s, server.url, [_signal()]) == (409, {"error": "run finished"})
+            async with s.get(server.url + "/feeds/edgar/poll") as r:  # collect the end so the server exits
+                assert (await r.json())["end"] is True
+            return await server.result()
+
+    log = _run(main())
+    assert [x.story_id for x in log.signals] == ["s00"]
+
+
+def test_slow_subscriber_does_not_stall_other_subscribers():
+    big = "x" * 200_000  # 20 MB in all: far beyond what socket buffers hold for a reader that never reads
+    stories = [dataclasses.replace(_story(i, 0.01 * i), summary=big) for i in range(100)]
+    plan = plan_pass(stories, [], gap_cap_s=0.01, seed=2, feeds=FAST_FEEDS, warmup_gap_s=0.0)
+
+    async def main():
+        server = await Server(plan, send_timeout_s=0.2, subscriber_queue_max=50).start()
+        received = []
+        async with aiohttp.ClientSession() as s:
+            url = server.url + "/feeds/benzinga/ws"
+            fast, _stuck = await s.ws_connect(url), await s.ws_connect(url)  # the second is never read
+            async with s.post(server.url + "/ready"):
+                pass
+            async for frame in fast:
+                msg = json.loads(frame.data)
+                if msg["type"] == "end":
+                    break
+                received.append(msg["story_id"])
+            await server.result()
+        return received
+
+    assert sorted(_run(main())) == [s.story_id for s in stories]  # jitter may swap neighbours

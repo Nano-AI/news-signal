@@ -20,6 +20,8 @@ READY_LEAD_S = 1.0  # t0 = first /ready + this, so every client has time to sett
 MAX_POLL_WAIT_MS = 1000
 MAX_POLL_LIMIT = 500
 _SLEEP_CAP_S = 0.05
+SEND_TIMEOUT_S = 1.0  # a single ws send stuck this long disconnects the subscriber
+SUBSCRIBER_QUEUE_MAX = 1000  # undelivered messages per ws subscriber before it is disconnected
 _END_LINGER_S = 5.0  # guard: how long to wait for pollers to collect their end
 
 
@@ -38,8 +40,11 @@ class PassLog:
     signals: list[ReceivedSignal]  # accepted signals, duplicates included
     invalid: dict[str, int]  # rejection reason -> count
     schema_errors: int
-    send_lag_ms: list[float]
+    send_lag_ms: list[float]  # actual - scheduled send instant, per delivery, in ms
     end_s: float
+    # story_id -> earliest actual send instant on any feed (seconds since t0), stamped just before the
+    # socket write (ws) or when the message becomes pollable (poll). Latency is measured from it.
+    sent_s: dict[str, float] = field(default_factory=dict)
 
 
 class ReadyTimeout(Exception):
@@ -71,16 +76,27 @@ def _int_param(request: web.Request, name: str, default: int, lo: int, hi: int |
     return value
 
 
+class _Sub:
+    """One ws subscriber: its own bounded queue and sender task, so a slow reader stalls nobody else."""
+
+    def __init__(self, ws: web.WebSocketResponse, transport, maxsize: int):
+        self.ws, self.transport = ws, transport
+        self.queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(maxsize)
+        self.task: asyncio.Task | None = None
+
+
 class _Pass:
-    def __init__(self, plan: ReplayPlan, clock: Callable[[], float]):
+    def __init__(self, plan: ReplayPlan, clock: Callable[[], float], send_timeout_s: float, queue_max: int):
         self.plan, self.clock = plan, clock
+        self.send_timeout_s, self.queue_max = send_timeout_s, queue_max
+        self.measured_ids = {s.story_id for s in plan.measured}
         self.feeds: dict[str, str] = {f.name: f.transport for f in FEEDS}  # name -> transport
         unknown = {d.feed for d in plan.deliveries} - self.feeds.keys()
         if unknown:
             raise ValueError(f"plan uses feeds outside replay.FEEDS: {sorted(unknown)}")
         self.stories: dict[str, Story] = {d.story.story_id: d.story for d in plan.deliveries}
         self.buffers: dict[str, list[dict]] = {name: [] for name in self.feeds}
-        self.subscribers: dict[str, set[web.WebSocketResponse]] = {name: set() for name in self.feeds}
+        self.subscribers: dict[str, set[_Sub]] = {name: set() for name in self.feeds}
         self.new_data = asyncio.Condition()
         self.ready = asyncio.Event()
         self.t0: float | None = None
@@ -88,6 +104,7 @@ class _Pass:
         self.released: set[str] = set()
         self.run_from = min((plan.release_s[s.story_id] for s in plan.measured), default=0.0)
         self.polled: set[str] = set()
+        self.senders: set[asyncio.Task] = set()
         self.ended: set[str] = set()
         self.ended_seen = asyncio.Event()
         self.log = PassLog(0.0, [], {}, 0, [], plan.last_s)
@@ -111,6 +128,30 @@ class _Pass:
 
     # -- scheduler -----------------------------------------------------------------------------
 
+    def _stamp(self, story_id: str) -> None:
+        assert self.t0 is not None
+        now = self.clock() - self.t0
+        if now < self.log.sent_s.get(story_id, now + 1):
+            self.log.sent_s[story_id] = now
+
+    def _drop(self, feed: str, sub: _Sub) -> None:
+        self.subscribers[feed].discard(sub)
+        if sub.transport is not None:
+            sub.transport.abort()  # also ends the handler's read loop
+
+    async def _sender(self, feed: str, sub: _Sub) -> None:
+        try:
+            while (item := await sub.queue.get()) is not None:
+                story_id, text = item
+                self._stamp(story_id)
+                async with asyncio.timeout(self.send_timeout_s):
+                    await sub.ws.send_str(text)
+            async with asyncio.timeout(self.send_timeout_s):
+                await sub.ws.send_str(json.dumps({"type": "end"}))
+                await sub.ws.close()
+        except Exception:  # stuck (timeout) or broken connection
+            self._drop(feed, sub)
+
     async def deliver(self, d: Delivery) -> None:
         assert self.t0 is not None
         await self.sleep_until(d.at_s)
@@ -127,24 +168,19 @@ class _Pass:
             headline=story.headline,
             summary=story.summary,
         ).model_dump(mode="json")
-        self.released.add(story.story_id)
+        if story.story_id in self.measured_ids:
+            self.released.add(story.story_id)
+        text = json.dumps(msg)
+        for sub in list(self.subscribers[d.feed]):
+            try:
+                sub.queue.put_nowait((story.story_id, text))
+            except asyncio.QueueFull:
+                self._drop(d.feed, sub)
+        if self.feeds[d.feed] == "poll":
+            self._stamp(story.story_id)
         async with self.new_data:
             self.buffers[d.feed].append(msg)
             self.new_data.notify_all()
-        await self._broadcast(d.feed, json.dumps(msg))
-
-    async def _broadcast(self, feed: str, text: str, *, close: bool = False) -> None:
-        subs = list(self.subscribers[feed])
-
-        async def send(ws: web.WebSocketResponse) -> None:
-            await ws.send_str(text)
-            if close:
-                await ws.close()
-
-        results = await asyncio.gather(*(send(ws) for ws in subs), return_exceptions=True)
-        for ws, result in zip(subs, results, strict=True):
-            if isinstance(result, BaseException):
-                self.subscribers[feed].discard(ws)
 
     async def run(self, drain_s: float) -> None:
         for d in self.plan.deliveries:
@@ -153,7 +189,13 @@ class _Pass:
         self.done = True
         async with self.new_data:
             self.new_data.notify_all()
-        await asyncio.gather(*(self._broadcast(f, json.dumps({"type": "end"}), close=True) for f in self.feeds))
+        for feed, subs in self.subscribers.items():
+            for sub in list(subs):
+                try:
+                    sub.queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    self._drop(feed, sub)
+        await asyncio.gather(*self.senders, return_exceptions=True)
         if self.polled - self.ended:
             try:
                 await asyncio.wait_for(self.ended_seen.wait(), _END_LINGER_S)
@@ -177,7 +219,7 @@ class _Pass:
         return web.json_response({"ok": True})
 
     async def status(self, request: web.Request) -> web.Response:
-        body = Status(state=self.state(), released=len(self.released), total=len(self.plan.release_s))
+        body = Status(state=self.state(), released=len(self.released), total=len(self.plan.measured))
         return web.json_response(body.model_dump(mode="json"))
 
     def _feed(self, request: web.Request, transport: str) -> str | None:
@@ -194,12 +236,17 @@ class _Pass:
             await ws.send_str(json.dumps({"type": "end"}))
             await ws.close()
             return ws
-        self.subscribers[name].add(ws)
+        sub = _Sub(ws, request.transport, self.queue_max)
+        sub.task = asyncio.create_task(self._sender(name, sub))
+        self.senders.add(sub.task)
+        self.subscribers[name].add(sub)
         try:
             async for _ in ws:  # frames from the client are ignored
                 pass
         finally:
-            self.subscribers[name].discard(ws)
+            self.subscribers[name].discard(sub)
+            if not self.done:
+                sub.task.cancel()
         return ws
 
     async def poll_handler(self, request: web.Request) -> web.Response:
@@ -232,7 +279,8 @@ class _Pass:
 
     async def signals_handler(self, request: web.Request) -> web.Response:
         body = await request.read()
-        received = None if self.t0 is None else self.clock() - self.t0
+        now = self.clock()
+        received = None if self.t0 is None else now - self.t0
         if self.done:
             return _error(409, "run finished")
         try:
@@ -251,7 +299,7 @@ class _Pass:
         for i, sig in enumerate(batch.signals):
             story = self.stories.get(sig.story_id)
             reason = None
-            if story is None or received is None or received < self.plan.available_s[sig.story_id]:
+            if story is None or received is None or now < self.t0 + self.plan.available_s[sig.story_id]:
                 reason = "not_yet_available"
             elif sig.ticker not in story.tickers:
                 reason = "unknown_ticker"
@@ -290,9 +338,11 @@ async def serve_pass(
     drain_s: float,
     on_listening: Callable[[], Awaitable[None]] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    send_timeout_s: float = SEND_TIMEOUT_S,
+    subscriber_queue_max: int = SUBSCRIBER_QUEUE_MAX,
 ) -> PassLog:
     """Serve `plan` on 127.0.0.1:`port` until it finishes; raise ReadyTimeout if nobody calls /ready."""
-    p = _Pass(plan, clock)
+    p = _Pass(plan, clock, send_timeout_s, subscriber_queue_max)
     p.log.end_s = plan.last_s + drain_s
     runner = web.AppRunner(_app(p), access_log=None, shutdown_timeout=1.0)
     await runner.setup()

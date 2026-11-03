@@ -44,7 +44,10 @@ every feed listed; names are not fixed.
 
 WebSocket upgrade. The server sends text frames, each a JSON `StoryMessage` or `{"type": "end"}`. Frames
 from the client are ignored. A subscriber receives only messages delivered after it connects, so open every
-subscription before calling `POST /ready`. After `end`, the server closes the socket.
+subscription before calling `POST /ready`. After `end`, the server closes the socket. Each subscriber has its own bounded queue (1000 messages) and
+sender: a subscriber whose queue overflows, or whose single send is stuck for more than 1 s, is disconnected
+and receives no more messages (its undelivered pairs count as missed unless another feed delivers them).
+One slow subscriber never delays another feed or subscriber.
 
 `StoryMessage`:
 
@@ -110,7 +113,7 @@ duplicate). The first signal for a `(story_id, ticker)` pair counts; later ones 
 `{"state": "waiting" | "warmup" | "running" | "draining" | "done", "released": int, "total": int}`.
 `waiting` is before `POST /ready`; `warmup` is after it, before the first story is released; `running`
 releases stories; `draining` is after the last release, while late signals are still accepted; `done` is
-the end. `released` is the number of stories released on any feed so far; `total` is the split's story count.
+the end. `released` is the number of stories released on any feed so far; `total` is the number of replayed (measured) stories, warmup excluded; `released` counts only those.
 
 ## Universe, horizon and labels
 
@@ -125,9 +128,14 @@ the end. `released` is the number of stories released on any feed so far; `total
   `09:31 <= local(p)` and `local(p + H) <= 16:00`; the start price comes from a one-minute bar that ended at
   or before `p` and is at most 30 minutes old; the end price comes from a bar that ended in `(p, p + H]`.
   Otherwise the return is `null`. A bar's close is its price at the bar's end (start + 60 s).
-- **Latency** of a pair: `receipt - min over feeds of (release + feed delay)`, where `release` is the story's
-  scheduled release instant on the (compressed) replay schedule and `feed delay` is that feed's own seeded
-  delay (0 or more). Receipt is the first accepted signal for the pair.
+- **Latency** of a pair: `receipt - min over feeds of send`, where `send` is the instant newsd actually sent
+  that story to the candidate on a feed: just before the socket write on a `ws` feed, the moment the message
+  becomes pollable on a `poll` feed. Receipt is the first accepted signal for the pair. Both are on newsd's
+  clock. A pair never signaled counts as missed, with latency `end - min send` (`end` is the end of the drain).
+  A story never sent on any feed uses its scheduled instant (`release + feed delay`) instead.
+- **Invalid pass**: newsd also records, for every delivery, its lateness (actual send minus scheduled send).
+  If the 99th percentile of that lateness exceeds 5 ms the server fell behind and the pass is marked
+  invalid in the score (`valid: false` with a reason); its latencies are not to be trusted.
 
 ## Semantics
 

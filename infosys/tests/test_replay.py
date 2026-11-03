@@ -73,6 +73,9 @@ def test_plan_invariants(specs, seed, warm, cap):
         assert len(real) == 1  # real feeds never drop or duplicate
         assert plan.available_s[story.story_id] >= plan.release_s[story.story_id]
         assert plan.available_s[story.story_id] == min(d.at_s for d in plan.deliveries if d.story is story)
+    if warm and len(stories) > warm:  # the warmup is over, on every feed, before the measured window opens
+        first_measured = min(plan.release_s[s.story_id] for s in plan.measured)
+        assert max(d.at_s for d in plan.deliveries if d.story.story_id in plan.warmup_ids) <= first_measured
     assert plan.last_s == max(d.at_s for d in plan.deliveries)
 
 
