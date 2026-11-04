@@ -914,6 +914,19 @@ def test_benchmark_main_writes_a_sidecar_with_the_per_feed_stats(tmp_path, monke
     assert stats["latency_ms"]["max"] == 30.0 and stats["throughput_signals_per_s"] == 50.0
 
 
+def test_unwritable_sidecar_does_not_fail_a_written_result(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    result = SimpleNamespace(score=_score(), log=SimpleNamespace(signals=[SimpleNamespace(direction=d) for d in (-1, 1)]),
+                             first_invalid=None, serve=passrun.ServeProbe())
+    monkeypatch.setattr(bench, "run_pass", lambda *a, **k: result)
+    monkeypatch.setattr(bench, "load_gate", _gate)
+    out = tmp_path / "o.jsonl"
+    (tmp_path / "o.jsonl.stats.json").mkdir()  # a directory where the sidecar goes
+    assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 0
+    assert _check_stream(out.read_text().splitlines())["kind"] == "result"
+
+
 def test_failed_benchmark_writes_no_sidecar(tmp_path, monkeypatch):
     monkeypatch.setattr(bench, "run_pass", lambda *a, **k: (_ for _ in ()).throw(PassError("x")))
     monkeypatch.setattr(bench, "load_gate", _gate)
@@ -956,6 +969,7 @@ def test_gpu_sampler_skips_a_failed_reading_after_a_good_one():
 def test_gpu_sampler_thread_samples_at_start_and_at_stop():
     readings = iter([1 << 20])
     sampler = passrun.GpuMemSampler(lambda: next(readings, 6 << 20), period_s=3600)  # the period never elapses
+    sampler.sample()
     sampler.start()
     sampler.stop()
     assert (sampler.idle_mib, sampler.peak_mib) == (1.0, 6.0)
@@ -974,20 +988,6 @@ def test_vram_is_summed_over_sysfs_cards_and_null_without_any_source(tmp_path, m
     monkeypatch.setattr(passrun, "_VRAM_USED_GLOB", str(tmp_path / "card[0-9]*/device/mem_info_vram_used"))
     assert passrun.read_vram_used_bytes() == 350
     monkeypatch.setattr(passrun, "_VRAM_USED_GLOB", str(tmp_path / "none*"))
-    monkeypatch.setattr(passrun.shutil, "which", lambda _: None)
-    assert passrun.read_vram_used_bytes() is None
-
-
-def test_vram_falls_back_to_rocm_smi_and_tolerates_its_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(passrun, "_VRAM_USED_GLOB", str(tmp_path / "none*"))
-    fake = tmp_path / "rocm-smi"
-    fake.write_text('#!/bin/sh\necho \'{"card0": {"VRAM Total Used Memory (B)": "1000"}, "card1": {"VRAM Total Used Memory (B)": "24"}}\'\n')
-    fake.chmod(0o755)
-    monkeypatch.setattr(passrun.shutil, "which", lambda _: str(fake))
-    assert passrun.read_vram_used_bytes() == 1024
-    fake.write_text("#!/bin/sh\necho not json\n")
-    assert passrun.read_vram_used_bytes() is None
-    fake.write_text("#!/bin/sh\nexit 3\n")
     assert passrun.read_vram_used_bytes() is None
 
 

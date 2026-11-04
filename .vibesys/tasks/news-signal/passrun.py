@@ -17,7 +17,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -379,20 +378,8 @@ _VRAM_USED_GLOB = "/sys/class/drm/card[0-9]*/device/mem_info_vram_used"  # bytes
 _MIB = 1 << 20
 
 
-def _rocm_smi_vram_used() -> int | None:
-    exe = shutil.which("rocm-smi")
-    if exe is None:
-        return None
-    try:
-        out = subprocess.run([exe, "--showmeminfo", "vram", "--json"], capture_output=True, text=True, timeout=10,
-                             check=True).stdout
-        return sum(int(v["VRAM Total Used Memory (B)"]) for k, v in json.loads(out).items() if k.startswith("card"))
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-
-
 def read_vram_used_bytes() -> int | None:
-    """VRAM in use summed over the host's GPUs (the node is exclusive): sysfs, else rocm-smi, else None."""
+    """VRAM in use summed over the host's GPUs (the node is exclusive): sysfs only, else None (no subprocess)."""
     total, found = 0, False
     for path in glob.glob(_VRAM_USED_GLOB):
         try:
@@ -400,7 +387,7 @@ def read_vram_used_bytes() -> int | None:
             found = True
         except (OSError, ValueError):
             pass
-    return total if found else _rocm_smi_vram_used()
+    return total if found else None
 
 
 class GpuMemSampler:
@@ -430,7 +417,8 @@ class GpuMemSampler:
         return True
 
     def start(self) -> None:
-        if self.sample():
+        """Begin polling; call after `sample()` took the idle reading, and after the serving child is forked."""
+        if self.idle_mib is not None:
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
 
@@ -441,8 +429,9 @@ class GpuMemSampler:
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=15)  # a rocm-smi read can take a few seconds
-            self.sample()  # the reading at the end of the pass
+            self._thread.join(timeout=15)
+            if not self._thread.is_alive():  # a hung read must not hang the pass
+                self.sample()  # the reading at the end of the pass
 
 
 @dataclass
@@ -470,7 +459,7 @@ async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, ma
     spawned: list[float] = []
 
     async def on_listening() -> None:
-        sampler.start()
+        sampler.sample()  # idle reading, before the fork: no thread may be alive across preexec_fn
         spawned.append(time.monotonic())  # newsd's default clock; the same one stamps log.ready_at
         with log.open("wb") as lf:
             procs.append(
@@ -479,6 +468,7 @@ async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, ma
                     preexec_fn=_serving_preexec,
                 )
             )
+        sampler.start()
         started.set()
 
     async def exited() -> int:

@@ -6,6 +6,7 @@ Writes an evaluator result-protocol-2 record stream to --vs-output (see sdk/vs-e
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import math
@@ -169,9 +170,10 @@ def main(argv: list[str] | None = None) -> int:
         records = [HELLO, error_record(f"unexpected {type(e).__name__} in the benchmark harness")]
     write_records(a.vs_output, records)
     if records[-1]["kind"] == "result":  # sidecar next to the stream: <vs-output>.stats.json
-        a.vs_output.with_name(a.vs_output.name + ".stats.json").write_text(
-            json.dumps(stats_for(result.score, result.serve), indent=2) + "\n"
-        )
+        with contextlib.suppress(OSError):  # record only: it must never fail a round whose result is written
+            a.vs_output.with_name(a.vs_output.name + ".stats.json").write_text(
+                json.dumps(stats_for(result.score, result.serve), indent=2) + "\n"
+            )
     final = records[-1]
     if final["kind"] == "error":
         print(f"benchmark failed: {final['message']}")
@@ -179,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     v = final["values"]
     print(
         f"bursts: stories={v['stories']} p50={v['p50_latency_ms']:.1f}ms p90={v['p90_latency_ms']:.1f}ms "
-        f"p99={v['p99_latency_ms']:.1f}ms max={v['max_latency_ms']:.1f}ms throughput={v['throughput_signals_per_s']:.1f}/s "
+        f"p99={v['p99_latency_ms']:.1f}ms max={_fmt(v.get('max_latency_ms'))}ms throughput={v['throughput_signals_per_s']:.1f}/s "
         f"send_lag_p90={v['newsd_send_lag_p90_ms']:.2f}ms p99={v['newsd_send_lag_p99_ms']:.2f}ms reruns={v['reruns']} "
         f"cold_start={_fmt(v.get('cold_start_s'))}s gpu_mem_peak={_fmt(v.get('gpu_mem_peak_mib'))}MiB"
     )

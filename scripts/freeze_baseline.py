@@ -402,6 +402,7 @@ class Freezer:
             streams = [a for a in re.findall(r"ARTIFACT (\S+)", log) if not a.endswith(".stats.json")]
             for src, dst in zip(streams, paths, strict=True):
                 (self.runs / src).replace(dst)
+                Path(f"{dst}.stats.json").unlink(missing_ok=True)  # never pair an old sidecar with a new stream
                 if (self.runs / f"{src}.stats.json").exists():  # record-only sidecar (per-feed, cold start, GPU memory)
                     (self.runs / f"{src}.stats.json").replace(f"{dst}.stats.json")
                 self.stamp(dst)
