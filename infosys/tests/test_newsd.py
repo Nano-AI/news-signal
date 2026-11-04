@@ -184,6 +184,10 @@ def test_pass_end_to_end_never_early():
     for story in stories:
         assert first_seen[story.story_id] - t0 >= plan.available_s[story.story_id] - 1e-9
         assert log.sent_s[story.story_id] >= plan.available_s[story.story_id] - 1e-9
+    # per-feed hand-over instants: every feed has a key, and a story's earliest send is the min over its feeds
+    assert set(log.feed_sent_s) == {f.name for f in FEEDS} and log.ready_at == 100.0  # the fake clock at /ready
+    for story_id, sent in log.sent_s.items():
+        assert sent == min(stamps[story_id] for stamps in log.feed_sent_s.values() if story_id in stamps)
 
 
 def _manual_plan():

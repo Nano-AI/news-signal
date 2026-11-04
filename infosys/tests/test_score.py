@@ -2,6 +2,8 @@ from datetime import UTC, datetime
 
 import numpy as np
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from infosys.newsd import PassLog, ReceivedSignal
 from infosys.replay import ReplayPlan
@@ -155,3 +157,39 @@ def test_bounds_are_inclusive_and_both_named():
 def test_send_lag_fields_are_in_the_score():
     fields = _lagged({}).send_lag_ms
     assert set(fields) == {"p50", "p90", "p99", "max"}
+
+
+def _feed_log(signals, feed_sent, sent_s=None, end_s=100.0) -> PassLog:
+    return PassLog(0.0, signals, {}, 0, [1.0], end_s, sent_s or {}, feed_sent)
+
+
+def test_per_feed_latency_and_first_counts():
+    s1, s2 = _story(1), _story(2, ("AAA", "BBB"))
+    plan = _plan([s1, s2], [1.0, 2.0])
+    feed_sent = {"fast": {"s1": 1.0, "s2": 2.0}, "slow": {"s1": 1.5, "s2": 1.75}, "idle": {}}
+    log = _feed_log([_sig("s1", received=1.25), _sig("s2", received=2.5)], feed_sent)  # (s2, BBB) is missed
+    feeds = score_pass(plan, log, _bars({}), horizon_min=5).feed_latency_ms
+    assert feeds["fast"] == {"pairs": 2, "p50": np.percentile([250, 500], 50), "p99": np.percentile([250, 500], 99), "first": 1}
+    # slow delivered s1 after the signal was already in: negative, and it was first for s2
+    assert feeds["slow"] == {"pairs": 2, "p50": np.percentile([-250, 750], 50), "p99": np.percentile([-250, 750], 99), "first": 1}
+    assert feeds["idle"] == {"pairs": 0, "p50": None, "p99": None, "first": 0}
+
+
+def test_per_feed_first_ties_go_to_the_first_name_and_warmup_is_ignored():
+    warm, s1 = _story(0), _story(1)
+    plan = _plan([s1], [1.0], warmup=(warm,))
+    feed_sent = {"b": {"s1": 1.0, "s0": 0.1}, "a": {"s1": 1.0, "s0": 0.1}}
+    feeds = score_pass(plan, _feed_log([_sig("s1", received=2.0), _sig("s0", received=0.5)], feed_sent), _bars({}), horizon_min=5).feed_latency_ms
+    assert (feeds["a"]["first"], feeds["b"]["first"], feeds["a"]["pairs"]) == (1, 0, 1)
+
+
+@given(st.lists(st.tuples(st.floats(0, 50), st.floats(0, 50)), min_size=1, max_size=20))
+def test_per_feed_first_counts_sum_to_the_stories_sent(offsets):
+    stories = [_story(i) for i in range(len(offsets))]
+    plan = _plan(stories, [0.0] * len(stories))
+    feed_sent = {"x": {f"s{i}": a for i, (a, _) in enumerate(offsets)}, "y": {f"s{i}": b for i, (_, b) in enumerate(offsets)}}
+    log = _feed_log([_sig(f"s{i}", received=100.0) for i in range(len(stories))], feed_sent)
+    feeds = score_pass(plan, log, _bars({}), horizon_min=5).feed_latency_ms
+    assert feeds["x"]["first"] + feeds["y"]["first"] == len(stories)
+    assert feeds["x"]["pairs"] == feeds["y"]["pairs"] == len(stories)
+    assert feeds["x"]["first"] == sum(a <= b for a, b in offsets)

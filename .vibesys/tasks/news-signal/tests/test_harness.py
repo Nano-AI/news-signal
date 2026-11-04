@@ -173,7 +173,23 @@ def test_prepare_failure_is_reported(repo):
 
 @pytest.fixture(scope="module")
 def smoke(tiny_model):
-    return passrun.run_pass(Mode.SMOKE, "validation", device="cpu", model=str(tiny_model))
+    readings = iter([3 << 20])  # 3 MiB before the spawn, 7 MiB at every later reading (the end of the pass included)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(passrun, "read_vram_used_bytes", lambda: next(readings, 7 << 20))
+        return passrun.run_pass(Mode.SMOKE, "validation", device="cpu", model=str(tiny_model))
+
+
+def test_smoke_pass_records_cold_start_gpu_memory_and_per_feed_latency(smoke):
+    from infosys.replay import FEEDS
+
+    assert 0 < smoke.serve.cold_start_s < BOUND_S
+    assert (smoke.serve.gpu_mem_idle_mib, smoke.serve.gpu_mem_peak_mib) == (3.0, 7.0)
+    feeds = smoke.score.feed_latency_ms
+    assert set(feeds) == {f.name for f in FEEDS}
+    assert sum(f["first"] for f in feeds.values()) == smoke.score.stories
+    real = [f.name for f in FEEDS if f.real]  # real feeds never drop and split the stories by source
+    assert sum(feeds[n]["pairs"] for n in real) == smoke.score.signaled
 
 
 def test_smoke_pass_loses_no_early_story(smoke):
@@ -416,18 +432,26 @@ def freezer(repo, tmp_path):
     return module, module.Freezer(runs, set()), runs, repo
 
 
-def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0):
+def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0, sidecars=True):
     score = {"stories": 1000, "scored_pairs": 700, "ic": ic, "ic_se": 0.01, "missed": 0 if clean else 3,
-             "duplicates": 0, "invalid": 0, "valid": True}  # fmt: skip
-    (runs / "f1.json").write_text(json.dumps({"score": score}))
+             "duplicates": 0, "invalid": 0, "valid": True,
+             "latency_ms": {"p50": 5.0, "p90": 9.0, "p99": 20.0, "max": 30.0}, "throughput_per_s": 50.0,
+             "send_lag_ms": {"p50": 0.2, "p90": 0.3, "p99": 0.4, "max": 0.9},
+             "feed_latency_ms": FEEDS_STATS if sidecars else {}}  # fmt: skip
+    serve = {"cold_start_s": 12.5, "gpu_mem_idle_mib": 300.0, "gpu_mem_peak_mib": 4096.0} if sidecars else {}
+    (runs / "f1.json").write_text(json.dumps({"score": score, "serve": serve}))
+    (runs / "cpu-acc.json").write_text(json.dumps({"horizons": {}}))
     fz.stamp(runs / "f1.json")
     for i, p99 in enumerate((100.0, 104.0), start=1):
         values = {"p99_latency_ms": p99, "p50_latency_ms": 10.0, "stories": 300, "ic": bursts_ic,
                   "newsd_send_lag_p50_ms": 0.7, "newsd_send_lag_p90_ms": lag_p90, "newsd_send_lag_p99_ms": 20.0,
-                  "newsd_send_lag_max_ms": 25.0}  # fmt: skip
+                  "newsd_send_lag_max_ms": 25.0, "p90_latency_ms": 50.0, "max_latency_ms": 30.0,
+                  "throughput_signals_per_s": 50.0}  # fmt: skip
         rec = {"kind": "result", "label": "", "values": values}
         (runs / f"bench-{i}.jsonl").write_text(json.dumps(bench.HELLO) + "\n" + json.dumps(rec) + "\n")
         fz.stamp(runs / f"bench-{i}.jsonl")
+        if sidecars:
+            (runs / f"bench-{i}.jsonl.stats.json").write_text(json.dumps({"feeds": FEEDS_STATS, "serve": serve}))
 
 
 def test_freeze_rewrites_task_files_idempotently(freezer):
@@ -843,3 +867,185 @@ def test_gate_commands_are_plain_uv_run_python():
         cmd = spec[gate]["command"]
         assert cmd[:3] == ["uv", "run", "python"], cmd
         assert cmd[3] == f"${{PROJECT_ROOT}}/.vibesys/tasks/news-signal/{script}", cmd
+
+
+# -- record-only stats: p90/max latency, throughput, cold start, GPU memory, per-feed latency ------------
+
+FEEDS_STATS = {"benzinga": {"pairs": 900, "p50": 6.0, "p99": 25.0, "first": 60},
+               "syn-1": {"pairs": 0, "p50": None, "p99": None, "first": 0}}  # fmt: skip
+
+
+def test_benchmark_record_carries_the_record_only_scalars(tmp_path):
+    serve = passrun.ServeProbe(cold_start_s=12.5, gpu_mem_idle_mib=300.0, gpu_mem_peak_mib=4096.0)
+    rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, None, serve)))
+    v = rec["values"]
+    assert (v["p90_latency_ms"], v["max_latency_ms"], v["throughput_signals_per_s"]) == (9.0, 30.0, 50.0)
+    assert (v["cold_start_s"], v["gpu_mem_peak_mib"]) == (12.5, 4096.0)
+
+
+def test_unreadable_gpu_memory_and_unknown_cold_start_are_absent_not_failures(tmp_path):
+    for serve in (None, passrun.ServeProbe()):
+        rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, None, serve)))
+        assert rec["kind"] == "result" and "gpu_mem_peak_mib" not in rec["values"] and "cold_start_s" not in rec["values"]
+
+
+def test_record_only_numbers_change_no_decision():
+    base, odd = _score(), _score(feed_latency_ms=FEEDS_STATS)
+    gate = _gate()
+    assert checker.evaluate_gate(base, gate) == checker.evaluate_gate(odd, gate) is None
+    serve = passrun.ServeProbe(cold_start_s=1e6, gpu_mem_peak_mib=1e9)
+    kinds = {bench.records_for(base, gate, DIRS, None, s)[-1]["kind"] for s in (None, serve)}
+    assert kinds == {"result"}
+
+
+def test_benchmark_main_writes_a_sidecar_with_the_per_feed_stats(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    serve = passrun.ServeProbe(cold_start_s=2.0, gpu_mem_peak_mib=None)
+    result = SimpleNamespace(score=_score(feed_latency_ms=FEEDS_STATS), log=SimpleNamespace(signals=[]), first_invalid=None, serve=serve)
+    result.log.signals = [SimpleNamespace(direction=d) for d in (-1, 1)]
+    monkeypatch.setattr(bench, "run_pass", lambda *a, **k: result)
+    monkeypatch.setattr(bench, "load_gate", _gate)
+    out = tmp_path / "o.jsonl"
+    assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 0
+    _check_stream(out.read_text().splitlines())
+    stats = json.loads((tmp_path / "o.jsonl.stats.json").read_text())
+    assert stats["feeds"] == FEEDS_STATS and stats["serve"]["gpu_mem_peak_mib"] is None
+    assert stats["latency_ms"]["max"] == 30.0 and stats["throughput_signals_per_s"] == 50.0
+
+
+def test_failed_benchmark_writes_no_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench, "run_pass", lambda *a, **k: (_ for _ in ()).throw(PassError("x")))
+    monkeypatch.setattr(bench, "load_gate", _gate)
+    assert bench.main(["--mode", "bursts", "--vs-output", str(tmp_path / "o.jsonl")]) == 1
+    assert not (tmp_path / "o.jsonl.stats.json").exists()
+
+
+def test_checker_json_has_the_new_fields(tmp_path):
+    from dataclasses import asdict
+
+    assert asdict(_score(feed_latency_ms=FEEDS_STATS))["feed_latency_ms"] == FEEDS_STATS
+    assert set(asdict(passrun.ServeProbe())) == {"cold_start_s", "gpu_mem_idle_mib", "gpu_mem_peak_mib"}
+
+
+def test_gpu_sampler_keeps_the_peak_and_the_first_reading_as_idle():
+    readings = iter([1 << 20, 9 << 20, 4 << 20])
+    sampler = passrun.GpuMemSampler(lambda: next(readings))
+    assert [sampler.sample() for _ in range(3)] == [True] * 3
+    assert (sampler.idle_mib, sampler.peak_mib) == (1.0, 9.0)
+
+
+def test_gpu_sampler_is_null_when_nothing_can_be_read_and_never_raises():
+    def broken():
+        raise RuntimeError("driver")
+
+    for read in (lambda: None, broken):
+        sampler = passrun.GpuMemSampler(read)
+        sampler.start()
+        sampler.stop()
+        assert (sampler.idle_mib, sampler.peak_mib) == (None, None)
+
+
+def test_gpu_sampler_skips_a_failed_reading_after_a_good_one():
+    readings = iter([2 << 20, None, 5 << 20])
+    sampler = passrun.GpuMemSampler(lambda: next(readings))
+    assert [sampler.sample() for _ in range(3)] == [True, False, True]
+    assert sampler.peak_mib == 5.0
+
+
+def test_gpu_sampler_thread_samples_at_start_and_at_stop():
+    readings = iter([1 << 20])
+    sampler = passrun.GpuMemSampler(lambda: next(readings, 6 << 20), period_s=3600)  # the period never elapses
+    sampler.start()
+    sampler.stop()
+    assert (sampler.idle_mib, sampler.peak_mib) == (1.0, 6.0)
+
+
+def test_gpu_sampling_period_does_not_disturb_latency():
+    assert passrun.GPU_SAMPLE_PERIOD_S >= 0.1
+
+
+def test_vram_is_summed_over_sysfs_cards_and_null_without_any_source(tmp_path, monkeypatch):
+    for i, used in enumerate((100, 250)):
+        card = tmp_path / f"card{i}" / "device"
+        card.mkdir(parents=True)
+        (card / "mem_info_vram_used").write_text(f"{used}\n")
+    (tmp_path / "card1-DP-1").mkdir()
+    monkeypatch.setattr(passrun, "_VRAM_USED_GLOB", str(tmp_path / "card[0-9]*/device/mem_info_vram_used"))
+    assert passrun.read_vram_used_bytes() == 350
+    monkeypatch.setattr(passrun, "_VRAM_USED_GLOB", str(tmp_path / "none*"))
+    monkeypatch.setattr(passrun.shutil, "which", lambda _: None)
+    assert passrun.read_vram_used_bytes() is None
+
+
+def test_vram_falls_back_to_rocm_smi_and_tolerates_its_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(passrun, "_VRAM_USED_GLOB", str(tmp_path / "none*"))
+    fake = tmp_path / "rocm-smi"
+    fake.write_text('#!/bin/sh\necho \'{"card0": {"VRAM Total Used Memory (B)": "1000"}, "card1": {"VRAM Total Used Memory (B)": "24"}}\'\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(passrun.shutil, "which", lambda _: str(fake))
+    assert passrun.read_vram_used_bytes() == 1024
+    fake.write_text("#!/bin/sh\necho not json\n")
+    assert passrun.read_vram_used_bytes() is None
+    fake.write_text("#!/bin/sh\nexit 3\n")
+    assert passrun.read_vram_used_bytes() is None
+
+
+def test_freeze_surfaces_record_only_stats_without_touching_decisions(freezer):
+    module, fz, runs, repo = freezer
+    _artifacts(fz, runs)
+    task = repo / ".vibesys" / "tasks" / "news-signal"
+    gate_before = None
+    fz.freeze()
+    gate_before = (task / "gate.toml").read_bytes()
+    md = (task / "OBJECTIVE.md").read_text()
+    assert "### Baseline (record only)" in md and "peak GPU memory 4096 MiB" in md and "model load (spawn to ready) 12.5 s" in md
+    assert "feed `benzinga`: 900 pairs" in md and "first on 60 stories" in md and "max 30.0" in md
+    assert "throughput 50.0 signals/s" in md
+    full = json.loads((runs / "baseline-stats.json").read_text())
+    assert set(full) == {"commit", "f1", "f2", "cpu_acc"} and full["f2"][1]["stats"]["serve"]["cold_start_s"] == 12.5
+    assert full["cpu_acc"] == {"horizons": {}}
+    for key in ("cold_start", "gpu_mem", "feed", "throughput", "max_latency"):
+        assert key not in gate_before.decode() and key not in (task / "objectives.toml").read_text()
+
+
+def test_baseline_stats_file_is_never_overwritten(freezer):
+    _, fz, runs, _ = freezer
+    _artifacts(fz, runs)
+    fz.freeze()
+    first = (runs / "baseline-stats.json").read_text()
+    fz.freeze()
+    fz.freeze()
+    assert (runs / "baseline-stats.json").read_text() == first
+    siblings = sorted(p.name for p in runs.glob("baseline-stats-*.json"))
+    assert len(siblings) == 2 and len(set(siblings)) == 2  # same second or not, each write got its own file
+
+
+def test_freeze_prints_the_record_only_block(freezer, capsys):
+    _, fz, runs, _ = freezer
+    _artifacts(fz, runs)
+    fz.freeze()
+    out = capsys.readouterr().out
+    printed = json.loads(out[out.index("{"):])
+    assert printed["record_only"]["f1"]["gpu_mem_peak_mib"] == 4096.0
+    assert [r["latency_ms"]["max"] for r in printed["record_only"]["f2"]] == [30.0, 30.0]
+    assert printed["record_only"]["f2"][0]["feeds"]["benzinga"]["first"] == 60
+
+
+def test_freeze_without_record_only_sidecars_writes_nulls(freezer):
+    _, fz, runs, _ = freezer
+    _artifacts(fz, runs, sidecars=False)
+    fz.freeze()
+    md = (freezer[3] / ".vibesys" / "tasks" / "news-signal" / "OBJECTIVE.md").read_text()
+    assert "Bursts run 1: latency p50 10.0" in md and "model load (spawn to ready) null" in md
+
+
+def test_write_new_never_overwrites(tmp_path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("fz_w", ROOT / "scripts" / "freeze_baseline.py")
+    fb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fb)
+    target = tmp_path / "x.json"
+    paths = [fb.write_new(target, str(i)) for i in range(3)]
+    assert paths[0] == target and len(set(paths)) == 3 and [p.read_text() for p in paths] == ["0", "1", "2"]

@@ -46,6 +46,10 @@ class PassLog:
     # story_id -> earliest instant newsd handed the story to a subscriber's queue (ws) or made it pollable
     # (poll), in seconds since t0. Latency is measured from it.
     sent_s: dict[str, float] = field(default_factory=dict)
+    # feed -> story_id -> the same instant, per feed: when that feed handed the story over. Every feed has a key.
+    feed_sent_s: dict[str, dict[str, float]] = field(default_factory=dict)
+    # clock reading at the first POST /ready (same clock as t0 + a lead); None if nobody called it
+    ready_at: float | None = None
 
 
 class ReadyTimeout(Exception):
@@ -112,7 +116,7 @@ class _Pass:
         self.ended_seen = asyncio.Event()
         self.pending = {(s.story_id, t) for s in plan.measured for t in s.tickers}  # no first signal yet
         self.last_signal_s = 0.0
-        self.log = PassLog(0.0, [], {}, 0, [], plan.last_s)
+        self.log = PassLog(0.0, [], {}, 0, [], plan.last_s, feed_sent_s={name: {} for name in self.feeds})
 
     # -- state ---------------------------------------------------------------------------------
 
@@ -133,9 +137,10 @@ class _Pass:
 
     # -- scheduler -----------------------------------------------------------------------------
 
-    def _stamp(self, story_id: str) -> None:
+    def _stamp(self, story_id: str, feed: str) -> None:
         assert self.t0 is not None
         now = self.clock() - self.t0
+        self.log.feed_sent_s[feed].setdefault(story_id, now)
         if now < self.log.sent_s.get(story_id, now + 1):
             self.log.sent_s[story_id] = now
 
@@ -179,11 +184,11 @@ class _Pass:
         for sub in list(self.subscribers[d.feed]):
             try:
                 sub.queue.put_nowait((story.story_id, text))
-                self._stamp(story.story_id)  # handed to the subscriber: its own backpressure cannot delay this
+                self._stamp(story.story_id, d.feed)  # handed to the subscriber: its own backpressure cannot delay this
             except asyncio.QueueFull:
                 self._drop(d.feed, sub)
         if self.feeds[d.feed] == "poll":
-            self._stamp(story.story_id)
+            self._stamp(story.story_id, d.feed)
         async with self.new_data:
             self.buffers[d.feed].append(msg)
             self.new_data.notify_all()
@@ -225,7 +230,8 @@ class _Pass:
 
     async def ready_handler(self, request: web.Request) -> web.Response:
         if self.t0 is None:
-            self.t0 = self.clock() + READY_LEAD_S
+            self.log.ready_at = self.clock()
+            self.t0 = self.log.ready_at + READY_LEAD_S
             self.log.t0 = self.t0
             self.ready.set()
         return web.json_response({"ok": True})

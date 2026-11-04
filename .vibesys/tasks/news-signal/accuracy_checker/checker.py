@@ -80,6 +80,19 @@ def main(argv: list[str] | None = None) -> int:
         hs = s if h == gate["h_minutes"] else rescore(result, h)
         per_horizon[h] = {"ic": hs.ic, "ic_se": hs.ic_se, "scored_pairs": hs.scored_pairs}
         print(f"ic@{h}={_fmt(hs.ic)} se={_fmt(hs.ic_se)}")
+    lat = s.latency_ms
+    print(
+        f"latency_ms: p50={_fmt(lat['p50'], 1)} p90={_fmt(lat['p90'], 1)} p99={_fmt(lat['p99'], 1)} max={_fmt(lat['max'], 1)} "
+        f"throughput={s.throughput_per_s:.1f}/s send_lag_ms: p50={s.send_lag_ms['p50']:.2f} p90={s.send_lag_ms['p90']:.2f} "
+        f"p99={s.send_lag_ms['p99']:.2f} max={s.send_lag_ms['max']:.2f}"
+    )
+    sv = result.serve
+    print(
+        f"serve: cold_start_s={_fmt(sv.cold_start_s, 1)} gpu_mem_idle_mib={_fmt(sv.gpu_mem_idle_mib, 0)} "
+        f"gpu_mem_peak_mib={_fmt(sv.gpu_mem_peak_mib, 0)}"
+    )
+    for feed, f in s.feed_latency_ms.items():
+        print(f"feed {feed}: pairs={f['pairs']} p50={_fmt(f['p50'], 1)}ms p99={_fmt(f['p99'], 1)}ms first={f['first']}")
     if result.first_invalid is not None:
         print(f"note: first pass was invalid ({result.first_invalid.invalid_reason}); the rerun is used")
     if not s.valid:
@@ -90,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "score": asdict(s),
                     "horizons": per_horizon,
+                    "serve": asdict(sv),
                     "first_pass": asdict(result.first_invalid) if result.first_invalid else None,
                 },
                 indent=2,

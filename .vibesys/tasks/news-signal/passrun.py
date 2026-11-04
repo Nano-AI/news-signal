@@ -11,19 +11,23 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import glob
 import gzip
 import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -368,8 +372,91 @@ async def _stop(proc: asyncio.subprocess.Process) -> None:
     await proc.wait()
 
 
+# -- serve-phase probes (record only; nothing here decides a pass) ---------------------------------------
+
+GPU_SAMPLE_PERIOD_S = 0.25  # at or above 100 ms so the sampler cannot disturb latency
+_VRAM_USED_GLOB = "/sys/class/drm/card[0-9]*/device/mem_info_vram_used"  # bytes, one file per GPU
+_MIB = 1 << 20
+
+
+def _rocm_smi_vram_used() -> int | None:
+    exe = shutil.which("rocm-smi")
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run([exe, "--showmeminfo", "vram", "--json"], capture_output=True, text=True, timeout=10,
+                             check=True).stdout
+        return sum(int(v["VRAM Total Used Memory (B)"]) for k, v in json.loads(out).items() if k.startswith("card"))
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def read_vram_used_bytes() -> int | None:
+    """VRAM in use summed over the host's GPUs (the node is exclusive): sysfs, else rocm-smi, else None."""
+    total, found = 0, False
+    for path in glob.glob(_VRAM_USED_GLOB):
+        try:
+            total += int(Path(path).read_text())
+            found = True
+        except (OSError, ValueError):
+            pass
+    return total if found else _rocm_smi_vram_used()
+
+
+class GpuMemSampler:
+    """Polls whole-device VRAM from the harness (outside the candidate's namespace; the candidate reports nothing).
+
+    `idle_mib` is the first reading, taken before the service is spawned; `peak_mib` the maximum since. Both stay
+    None when the first reading fails (CPU host, macOS, fixture), and a later failed reading is skipped.
+    """
+
+    def __init__(self, read: Callable[[], int | None] | None = None, period_s: float = GPU_SAMPLE_PERIOD_S):
+        self.read, self.period_s = read or read_vram_used_bytes, period_s
+        self.idle_mib: float | None = None
+        self.peak_mib: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def sample(self) -> bool:
+        try:
+            used = self.read()
+        except Exception:  # a probe must never fail a pass
+            used = None
+        if used is None:
+            return False
+        mib = used / _MIB
+        self.idle_mib = mib if self.idle_mib is None else self.idle_mib
+        self.peak_mib = mib if self.peak_mib is None else max(self.peak_mib, mib)
+        return True
+
+    def start(self) -> None:
+        if self.sample():
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.period_s):
+            self.sample()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=15)  # a rocm-smi read can take a few seconds
+            self.sample()  # the reading at the end of the pass
+
+
+@dataclass
+class ServeProbe:
+    """What the harness itself observed about the serving process in one attempt."""
+
+    cold_start_s: float | None = None  # spawn of the serving process to its POST /ready, on the harness clock
+    gpu_mem_idle_mib: float | None = None  # before the spawn
+    gpu_mem_peak_mib: float | None = None  # from the spawn to the end of the pass
+
+
 async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, make_cmd: Callable[[str], list[str]],
-                 root: Path, env: dict, log: Path, hiding: bool = False) -> PassLog:
+                 root: Path, env: dict, log: Path, hiding: bool = False, probe: ServeProbe | None = None,
+                 sampler: GpuMemSampler | None = None) -> PassLog:
     """Serve `plan` while racing the service process: its early exit fails the pass at once."""
     from infosys.newsd import ReadyTimeout, serve_pass
 
@@ -378,7 +465,13 @@ async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, ma
     procs: list[asyncio.subprocess.Process] = []
     started = asyncio.Event()
 
+    probe = probe if probe is not None else ServeProbe()
+    sampler = sampler if sampler is not None else GpuMemSampler()
+    spawned: list[float] = []
+
     async def on_listening() -> None:
+        sampler.start()
+        spawned.append(time.monotonic())  # newsd's default clock; the same one stamps log.ready_at
         with log.open("wb") as lf:
             procs.append(
                 await asyncio.create_subprocess_exec(
@@ -409,10 +502,15 @@ async def _drive(plan: ReplayPlan, *, ready_timeout_s: float, drain_s: float, ma
                     raise PassError("the scoring data cannot be hidden from the candidate (tmpfs mount failed); "
                                     "the pass is refused")
                 raise PassError(f"serving exited with code {rc} before the pass ended: {_tail(log)}")
-        return serve.result()
+        result = serve.result()
+        if spawned and result.ready_at is not None:
+            probe.cold_start_s = result.ready_at - spawned[0]
+        return result
     except ReadyTimeout as e:
         raise PassError(f"serving never became ready ({e}): {_tail(log)}") from None
     finally:
+        sampler.stop()
+        probe.gpu_mem_idle_mib, probe.gpu_mem_peak_mib = sampler.idle_mib, sampler.peak_mib
         watch.cancel()
         if not serve.done():
             serve.cancel()
@@ -431,6 +529,7 @@ class PassResult:
     bars: Bars
     score: PassScore  # of the last attempt
     first_invalid: PassScore | None = None  # the first attempt, when it was invalid and the pass was rerun
+    serve: ServeProbe = field(default_factory=ServeProbe)  # of the last attempt
 
 
 def run_with_retry(attempt: Callable[[], PassLog], score: Callable[[PassLog], PassScore]):
@@ -532,7 +631,10 @@ def run_pass(
             return hidden([sys.executable, "-m", "serving", "--newsd", url, "--model", model, "--device", device,
                            "--prepared", str(prepared)], hide, protect)
 
+        probes: list[ServeProbe] = []
+
         def attempt() -> PassLog:
+            probes.append(ServeProbe())
             return asyncio.run(
                 _drive(
                     plan,
@@ -543,6 +645,7 @@ def run_pass(
                     env=env,
                     log=tmp_dir / "serving.log",
                     hiding=hide is not None,
+                    probe=probes[-1],
                 )
             )
 
@@ -556,7 +659,7 @@ def run_pass(
             )
         finally:
             gc.unfreeze()
-    return PassResult(plan, log, bars, score, first)
+    return PassResult(plan, log, bars, score, first, probes[-1])
 
 
 if __name__ == "__main__":

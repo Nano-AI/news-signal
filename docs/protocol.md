@@ -142,6 +142,12 @@ the end. `released` is the number of stories released on any feed so far; `total
   node stalls only move the tail: an idle GPU node showed intermittent 15-20 ms stalls, while measured passes kept p90 around 1.5 ms.
   A stall bunches late stories, which makes the candidate's job harder, not easier, and latency is measured
   from the enqueue instant, so stalls never flatter the candidate.
+- **Recorded, not scored**: every pass also records, with no effect on the gates or the objectives:
+  p50, p90, p99 and max pair latency; throughput (measured pairs with a signal, divided by the time from the first
+  measured send to the last first-signal receipt); per feed, p50 and p99 of `receipt - that feed's send` over the
+  measured pairs it carried (negative when the signal came before that feed delivered) and how often it was
+  first to send a story; the time from spawning the service to its `POST /ready`; and the peak GPU memory in use
+  while the service runs, read by the harness from outside the namespace (`null` when the host exposes none).
 
 ## Semantics
 

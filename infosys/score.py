@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.stats import spearmanr
@@ -35,6 +35,8 @@ class PassScore:
     send_lag_ms: dict[str, float]  # p50, p90, p99, max of newsd's send lateness; zeros when nothing was sent
     valid: bool = True
     invalid_reason: str | None = None
+    # Record only. Per feed: {"pairs", "p50", "p99", "first"}; see _feed_stats. Empty when the log has no feeds.
+    feed_latency_ms: dict[str, dict[str, float | int | None]] = field(default_factory=dict)
 
 
 def _ic(x: np.ndarray, y: np.ndarray) -> float | None:
@@ -49,6 +51,28 @@ def _percentiles(values: list[float]) -> dict[str, float | None]:
         return {"p50": None, "p90": None, "p99": None, "max": None}
     p50, p90, p99 = (float(np.percentile(values, q)) for q in (50, 90, 99))
     return {"p50": p50, "p90": p90, "p99": p99, "max": float(max(values))}
+
+
+def _feed_stats(plan: ReplayPlan, log: PassLog, first: dict[tuple[str, str], ReceivedSignal]) -> dict:
+    """Per feed, over measured pairs with a signal that the feed carried: signal receipt minus that feed's own
+    hand-over instant of the story (negative when another feed's copy was acted on before this feed delivered).
+    "first" counts measured stories this feed handed over earliest (ties go to the feed name that sorts first)."""
+    lat: dict[str, list[float]] = {feed: [] for feed in log.feed_sent_s}
+    firsts = dict.fromkeys(lat, 0)
+    for story in plan.measured:
+        carried = [(stamps[story.story_id], feed) for feed, stamps in log.feed_sent_s.items() if story.story_id in stamps]
+        if carried:
+            firsts[min(carried)[1]] += 1
+        for ticker in story.tickers:
+            sig = first.get((story.story_id, ticker))
+            if sig is not None:
+                for at, feed in carried:
+                    lat[feed].append((sig.received_s - at) * 1000)
+    out = {}
+    for feed, values in lat.items():
+        p = _percentiles(values)
+        out[feed] = {"pairs": len(values), "p50": p["p50"], "p99": p["p99"], "first": firsts[feed]}
+    return out
 
 
 def score_pass(
@@ -143,4 +167,5 @@ def score_pass(
         send_lag_ms=send_lag,
         valid=reason is None,
         invalid_reason=reason,
+        feed_latency_ms=_feed_stats(plan, log, first),
     )

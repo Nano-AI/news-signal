@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -148,6 +149,45 @@ def task_hash() -> str:
 
 def git(*args: str) -> str:
     return sh(["git", *args], cwd=ROOT).stdout.strip()
+
+
+def write_new(path: Path, text: str) -> Path:
+    """Write `text` to `path`, or to a timestamped sibling if it exists: never overwrites."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    for p in itertools.chain([path], (path.with_name(f"{path.stem}-{stamp}-{n}{path.suffix}") for n in itertools.count())):
+        try:
+            with p.open("x") as f:
+                f.write(text)
+            return p
+        except FileExistsError:
+            continue
+    raise AssertionError("unreachable")
+
+
+def _ms(v: float | None) -> str:
+    return "n/a" if v is None else f"{v:.1f}"
+
+
+def record_only(latency: dict, throughput: float | None, send_lag: dict, feeds: dict, serve: dict) -> dict:
+    """The numbers that decide nothing, from one pass (F1 score, or F2 values plus its sidecar)."""
+    return {"latency_ms": latency, "throughput_signals_per_s": throughput, "send_lag_ms": send_lag,
+            "feeds": feeds, "cold_start_s": serve.get("cold_start_s"),
+            "gpu_mem_peak_mib": serve.get("gpu_mem_peak_mib"), "gpu_mem_idle_mib": serve.get("gpu_mem_idle_mib")}  # fmt: skip
+
+
+def record_line(name: str, r: dict) -> list[str]:
+    lat, lag = r["latency_ms"], r["send_lag_ms"]
+    tp = r["throughput_signals_per_s"]
+    mem = "null" if r["gpu_mem_peak_mib"] is None else f"{r['gpu_mem_peak_mib']:.0f} MiB (idle {_ms(r['gpu_mem_idle_mib'])} MiB)"
+    cold = "null" if r["cold_start_s"] is None else f"{r['cold_start_s']:.1f} s"
+    lines = [
+        f"- {name}: latency p50 {_ms(lat['p50'])}, p90 {_ms(lat['p90'])}, p99 {_ms(lat['p99'])}, max {_ms(lat['max'])} ms; "
+        f"throughput {'n/a' if tp is None else f'{tp:.1f}'} signals/s; send lag p50 {_ms(lag['p50'])}, p90 {_ms(lag['p90'])}, "
+        f"p99 {_ms(lag['p99'])}, max {_ms(lag['max'])} ms; model load (spawn to ready) {cold}; peak GPU memory {mem}."
+    ]
+    for feed, f in r["feeds"].items():
+        lines.append(f"  - feed `{feed}`: {f['pairs']} pairs, p50 {_ms(f['p50'])} ms, p99 {_ms(f['p99'])} ms, first on {f['first']} stories")
+    return lines
 
 
 class Freezer:
@@ -353,12 +393,17 @@ class Freezer:
                 "for i in 1 2; do\n"
                 "  $PY $T/benchmark/run.py --mode bursts --vs-output $CAMP/logs/bench-$i-$SLURM_JOB_ID.jsonl\n"
                 "  echo ARTIFACT bench-$i-$SLURM_JOB_ID.jsonl\n"
+                "  if [ -f $CAMP/logs/bench-$i-$SLURM_JOB_ID.jsonl.stats.json ]; then\n"
+                "    echo ARTIFACT bench-$i-$SLURM_JOB_ID.jsonl.stats.json; fi\n"
                 "done\n",
                 "F2_DONE",
                 F2_LIMIT,
             )
-            for src, dst in zip(re.findall(r"ARTIFACT (\S+)", log), paths, strict=True):
+            streams = [a for a in re.findall(r"ARTIFACT (\S+)", log) if not a.endswith(".stats.json")]
+            for src, dst in zip(streams, paths, strict=True):
                 (self.runs / src).replace(dst)
+                if (self.runs / f"{src}.stats.json").exists():  # record-only sidecar (per-feed, cold start, GPU memory)
+                    (self.runs / f"{src}.stats.json").replace(f"{dst}.stats.json")
                 self.stamp(dst)
         results = []
         for p in paths:
@@ -376,6 +421,10 @@ class Freezer:
         return results
 
     # -- freeze -----------------------------------------------------------------------------------
+
+    def stats_of(self, i: int) -> dict:
+        side = self.runs / f"bench-{i}.jsonl.stats.json"
+        return json.loads(side.read_text()) if side.exists() else {}
 
     def freeze(self) -> None:
         f1, (r1, r2) = self.f1(), self.f2()
@@ -405,6 +454,20 @@ class Freezer:
             "# PLACEHOLDER until the baseline is frozen: scripts/freeze_baseline.py sets it from the two baseline runs.",
             "# Set by scripts/freeze_baseline.py: max(0.03, the relative spread of the two baseline p99 runs, rounded up).",
         ))
+        sv = f1.get("serve") or {}
+        extra = [
+            record_only(s["latency_ms"], s["throughput_per_s"], s["send_lag_ms"], s.get("feed_latency_ms", {}), sv),
+            *(record_only({k: r.get(f"{k}_latency_ms") for k in ("p50", "p90", "p99")} | {"max": r.get("max_latency_ms")},
+                          r.get("throughput_signals_per_s"),
+                          {k: r.get(f"newsd_send_lag_{k}_ms") for k in ("p50", "p90", "p99", "max")},
+                          st.get("feeds", {}), st.get("serve", {}))
+              for r, st in ((r1, self.stats_of(1)), (r2, self.stats_of(2)))),
+        ]  # fmt: skip
+        cpu = self.runs / "cpu-acc.json"
+        written = write_new(self.runs / "baseline-stats.json", json.dumps(
+            {"commit": head, "f1": f1, "f2": [{"values": r1, "stats": self.stats_of(1)}, {"values": r2, "stats": self.stats_of(2)}],
+             "cpu_acc": json.loads(cpu.read_text()) if cpu.exists() else None}, indent=2) + "\n")  # fmt: skip
+        say(f"full F1/F2/cpu-acc records written to {written.name}")
         section = (
             "## Baseline\n\n"
             f"Unmodified `serving/` (plain FinBERT, one headline per call) at commit `{head}` on 1x MI210, "
@@ -414,14 +477,19 @@ class Freezer:
             f"gate floor `ic_floor` = {floor}.\n"
             f"- Bursts: IC {bursts_ic:.4f} (mean of two runs); p99 latency {p1:.1f} ms and {p2:.1f} ms "
             f"(p50 {r1['p50_latency_ms']:.1f} and {r2['p50_latency_ms']:.1f} ms; {r1['stories']:.0f} stories). "
-            f"Pareto `relative_noise` = {noise}.\n"
-        )
+            f"Pareto `relative_noise` = {noise}.\n\n"
+            "### Baseline (record only)\n\n"
+            "These decide nothing: no gate, objective, floor or validity rule reads them.\n\n"
+            + "\n".join([*record_line("Accuracy pass (F1)", extra[0]), *record_line("Bursts run 1", extra[1]),
+                         *record_line("Bursts run 2", extra[2])]) + "\n"
+        )  # fmt: skip
         md = OBJECTIVE_MD.read_text()
         OBJECTIVE_MD.write_text(md[: md.index("## Baseline")] + section)
         say(f"frozen at commit {head}:")
         print(json.dumps({"ic": ic, "ic_se": se, "ic_floor": floor, "bursts_ic": bursts_ic,
                           "validation_stories": s["stories"], "scored_pairs": s["scored_pairs"],
-                          "p99_ms": [p1, p2], "relative_noise": noise}, indent=2))  # fmt: skip
+                          "p99_ms": [p1, p2], "relative_noise": noise,
+                          "record_only": {"f1": extra[0], "f2": extra[1:]}}, indent=2))  # fmt: skip
 
 
 def main() -> None:
