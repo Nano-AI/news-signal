@@ -52,7 +52,7 @@ Face FinBERT classifier, one headline per call. Everything the service may rely 
 Two commands, both run from the repo root on the MI210 node.
 
 **Benchmark** (`benchmark/run.py --mode bursts`): replays the busiest five-minute windows of the validation
-split, up to 180 s of compressed replay (gaps capped at 2 s), on six feeds with different delays, drops and
+split, up to 180 s of compressed replay (gaps capped at 0.25 s), on six feeds with different delays, drops and
 duplicates. Latency of a pair is the time from `newsd` handing the story to the service to the first accepted
 signal for the pair. Reported: `p99_latency_ms` and `p50_latency_ms` (the objectives), `p90_latency_ms`,
 `throughput_signals_per_s`, `missed`, `duplicates`, `invalid`, `newsd_send_lag_p50_ms`, `_p90_ms`, `_p99_ms` and `_max_ms`. Also recorded, and decisive for

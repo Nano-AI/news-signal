@@ -70,7 +70,7 @@ service and the scorer from `.vibesys/tasks/news-signal/`.
 
 **Replay clock.** Stories replay in publication order. Gaps between stories are compressed and capped, so a
 trading day replays in minutes. The accuracy gate replays a fixed sample at a high rate. The benchmark replays
-the busiest five-minute windows of the validation split, up to 180 s, with gaps capped at 2 s.
+the busiest five-minute windows of the validation split, up to 180 s, with gaps capped at 0.25 s.
 
 **Latency.** The latency of a pair is the time from `newsd` handing the story to the service (on the earliest
 feed) to the first accepted signal for the pair. Both instants are on `newsd`'s clock. A pair never signaled

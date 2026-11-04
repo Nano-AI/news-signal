@@ -44,6 +44,7 @@ MANIFEST_PATH = TASK / "data.manifest.json"
 
 MAX_STORIES = 30000  # accuracy pass size; MAX_STORIES * ms_per_headline must stay under ~360 s
 BURSTS_WINDOW_S = 300
+BURSTS_GAP_CAP_S = 0.25  # real gaps have a ~10 min median; 0.25 s is still ~30x the per-story service time, so stories do not overlap
 BURSTS_BUDGET_S = 180.0  # raise to 240 only if the real data gives fewer than 300 measured stories
 MAX_TRAIN_STORIES = 50_000
 PREPARE_TIMEOUT_S = 1200
@@ -79,7 +80,7 @@ class PassError(Exception):
 def _bursts(stories: list[Story]) -> list[Story]:
     from infosys.replay import burst_windows
 
-    return burst_windows(stories, window_s=BURSTS_WINDOW_S, budget_s=BURSTS_BUDGET_S, gap_cap_s=2.0)
+    return burst_windows(stories, window_s=BURSTS_WINDOW_S, budget_s=BURSTS_BUDGET_S, gap_cap_s=BURSTS_GAP_CAP_S)
 
 
 def _accuracy(stories: list[Story]) -> list[Story]:
@@ -104,7 +105,7 @@ class PassSettings:
 
 
 SETTINGS: dict[Mode, PassSettings] = {
-    Mode.BURSTS: PassSettings(_bursts, 2.0, 1, 10.0, 600.0, 64, 10.0),
+    Mode.BURSTS: PassSettings(_bursts, BURSTS_GAP_CAP_S, 1, 10.0, 600.0, 64, 10.0),
     Mode.ACCURACY: PassSettings(_accuracy, 0.01, 2, 600.0, 600.0, 64, 10.0),
     Mode.SMOKE: PassSettings(_all, 0.05, 3, 5.0, 120.0, 16, 20.0),
 }

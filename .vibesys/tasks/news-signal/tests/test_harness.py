@@ -787,6 +787,10 @@ def test_two_invalid_passes_fail_and_name_both_reasons(tmp_path):
     assert "invalid pass" in checker.evaluate_gate(score, _gate())
 
 
+def test_bursts_mode_uses_the_named_gap_cap():
+    assert passrun.SETTINGS[Mode.BURSTS].gap_cap_s == passrun.BURSTS_GAP_CAP_S == 0.25
+
+
 def test_task_timeouts_cover_two_passes_and_prepare():
     import tomllib
 
