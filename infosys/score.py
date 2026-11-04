@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -37,6 +38,17 @@ class PassScore:
     invalid_reason: str | None = None
     # Record only. Per feed: {"pairs", "p50", "p99", "first"}; see _feed_stats. Empty when the log has no feeds.
     feed_latency_ms: dict[str, dict[str, float | int | None]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Fidelity:
+    """How closely a pass reproduces a reference signal set (the baseline FinBERT's), pair by pair."""
+
+    pairs: int  # measured pairs; each is in the reference
+    agreed: int  # pairs whose signal direction equals the reference direction; a missed pair never agrees
+    agreement: float  # agreed / pairs
+    both: int  # pairs the candidate signalled
+    spearman: float | None  # rank correlation of the two signals over those pairs; None if undefined
 
 
 def _ic(x: np.ndarray, y: np.ndarray) -> float | None:
@@ -75,14 +87,12 @@ def _feed_stats(plan: ReplayPlan, log: PassLog, first: dict[tuple[str, str], Rec
     return out
 
 
-def score_pass(
-    plan: ReplayPlan, log: PassLog, bars: Bars, *, horizon_min: int, bootstrap: int = 1000, bootstrap_seed: int = 0
-) -> PassScore:
-    """Measured pairs only; the first signal of a pair counts, later ones are duplicates."""
+def first_signals(plan: ReplayPlan, log: PassLog) -> tuple[dict[tuple[str, str], ReceivedSignal], int]:
+    """The first signal of each measured pair (log order is receipt order), and the count of later ones."""
     measured_pairs = {(s.story_id, t) for s in plan.measured for t in s.tickers}
     first: dict[tuple[str, str], ReceivedSignal] = {}
     duplicates = 0
-    for sig in log.signals:  # log order is receipt order
+    for sig in log.signals:
         key = (sig.story_id, sig.ticker)
         if key not in measured_pairs:
             continue
@@ -90,6 +100,42 @@ def score_pass(
             duplicates += 1
         else:
             first[key] = sig
+    return first, duplicates
+
+
+def _sign(v: float) -> int:
+    return (v > 0) - (v < 0)
+
+
+def fidelity(plan: ReplayPlan, log: PassLog, reference: Mapping[tuple[str, str], float]) -> Fidelity:
+    """Agreement and signal Spearman against `reference`, which maps (story_id, ticker) to direction * confidence.
+
+    Direction is the sign of the signal, the same `direction * confidence` as the IC: -1, 0 (neutral, or a zero
+    confidence) or +1. Neutral agrees only with neutral. Raises ValueError if a measured pair is not in the reference."""
+    first, _ = first_signals(plan, log)
+    keys = [(s.story_id, t) for s in plan.measured for t in s.tickers]
+    absent = sum(k not in reference for k in keys)
+    if absent:
+        raise ValueError(f"{absent} measured pairs are not in the reference")
+    cand, ref = [], []
+    agreed = 0
+    for key in keys:
+        sig = first.get(key)
+        if sig is not None:
+            cand.append(sig.direction * sig.confidence)
+            ref.append(reference[key])
+            agreed += _sign(cand[-1]) == _sign(ref[-1])
+    return Fidelity(
+        pairs=len(keys), agreed=agreed, agreement=agreed / len(keys) if keys else 0.0, both=len(cand),
+        spearman=_ic(np.array(cand), np.array(ref)),
+    )
+
+
+def score_pass(
+    plan: ReplayPlan, log: PassLog, bars: Bars, *, horizon_min: int, bootstrap: int = 1000, bootstrap_seed: int = 0
+) -> PassScore:
+    """Measured pairs only; the first signal of a pair counts, later ones are duplicates."""
+    first, duplicates = first_signals(plan, log)
 
     latencies: list[float] = []
     pairs = signaled = 0

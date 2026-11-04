@@ -11,14 +11,18 @@ passrun.py; `--force STAGE[,STAGE]` redoes one; `--stages a,b` limits the run):
     manifest  copy the store's manifest.json into the task as data.manifest.json
     pin       write the current infosys and repo digests into gate.toml
     budget    check the bursts replay has >= 300 stories, raising the window budget to 240 s if not
-    cpu-acc   CPU dry run of the accuracy checker on every horizon
-    h         pick H: the first of 5, 15, 30, 60 whose IC is more than 2 standard errors above zero
-    sizing    cap MAX_STORIES so the accuracy replay takes <= 360 s at the baseline's ms per headline
+    cpu-acc   CPU run of the baseline on every validation story: writes the reference signals into the store
+              (reference/validation.jsonl.gz), pins their sha256 in gate.toml, and records IC at every horizon
+    h         fix H = 5 and print the IC-by-horizon table (IC is record only, so this never stops the freeze)
     sync      refuse a dirty serving/ or infosys/, then rsync the checkout and the store to the cluster
     probe     (not in the default run) GPU job: the fixture pass in forced wrapper mode, umount and latency probes
-    f1        GPU job: the accuracy checker on the baseline, with the gate's own drain (report mode)
-    f2        GPU job: the bursts benchmark, twice
+    f1        GPU job: the accuracy checker on the baseline, with the gate's own drain (report mode); the freeze
+              stops unless it agrees with the CPU reference (agreement >= 0.99, Spearman >= 0.95)
+    f2        GPU job: the bursts benchmark, twice (their agreement is recorded)
     freeze    write gate.toml, objectives.toml and the OBJECTIVE.md baseline section; print the numbers
+
+There is no sizing stage: MAX_STORIES is a committed constant in passrun.py (30000, above the 19001-story validation
+split), so nothing is left for the freeze to decide.
 
 Artifacts live in $NS_RUNS (default ~/ns-runs); a submitted job's id is kept in `<name>.jobid` until its
 output is collected, so an interrupted run resumes the same job. Stdlib only.
@@ -27,6 +31,7 @@ output is collected, so an interrupted run resumes the same job. Stdlib only.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import itertools
 import json
@@ -45,11 +50,11 @@ GATE, OBJECTIVES, PASSRUN, OBJECTIVE_MD = (
     TASK / n for n in ("gate.toml", "objectives.toml", "passrun.py", "OBJECTIVE.md")
 )
 HORIZONS = (5, 15, 30, 60)
-MS_PER_HEADLINE = 8.51  # FinBERT baseline, median over single-headline calls on the target GPU (install smoke)
-REPLAY_BUDGET_S = 360
+H_MINUTES = 5  # IC is record only, so the label horizon is fixed
+REFERENCE_FILE = "reference/validation.jsonl.gz"  # under the store; a test pins it to passrun.REFERENCE_FILE
 F1_LIMIT = "00:20:00"  # replay (<= 5 min) + backlog + startup; the gate's drain ends early once pairs are in
 F2_LIMIT = "00:20:00"  # two benchmark runs, each may rerun an invalid pass once
-STAGES = ["manifest", "pin", "budget", "cpu-acc", "h", "sizing", "sync", "f1", "f2", "freeze"]
+STAGES = ["manifest", "pin", "budget", "cpu-acc", "h", "sync", "f1", "f2", "freeze"]
 MAX_PENDING_S = 3 * 3600
 SSH_TRIES = 3
 MAX_UNKNOWN_POLLS = 30  # consecutive polls that could not tell the job's state
@@ -119,11 +124,9 @@ def toml_str(s: str) -> str:
     return json.dumps(s)
 
 
-def derive(ic: float, ic_se: float, p99_a: float, p99_b: float) -> tuple[float, float]:
-    """(ic_floor, relative_noise): the floor is two standard errors under the baseline IC, truncated to 4 decimals."""
-    floor = math.floor((ic - 2 * ic_se) * 1e4) / 1e4
-    noise = max(0.03, math.ceil(abs(p99_a - p99_b) / ((p99_a + p99_b) / 2) * 100) / 100)
-    return floor, noise
+def relative_noise(p99_a: float, p99_b: float) -> float:
+    """The Pareto noise: the relative spread of the two baseline p99 runs, rounded up to 1%, at least 3%."""
+    return max(0.03, math.ceil(abs(p99_a - p99_b) / ((p99_a + p99_b) / 2) * 100) / 100)
 
 
 def require_finite(**values: object) -> None:
@@ -203,7 +206,8 @@ class Freezer:
         base = {"head": git("rev-parse", "HEAD"), "infosys": gate["infosys_sha256"], "repo": gate["repo_sha256"]}
         if not full:
             return base
-        return {**base, "h_minutes": gate["h_minutes"], "serving": tree_hash(ROOT / "serving"), "task": task_hash()}
+        return {**base, "h_minutes": gate["h_minutes"], "serving": tree_hash(ROOT / "serving"), "task": task_hash(),
+                "reference": gate["baseline"]["reference_sha256"]}  # fmt: skip
 
     def todo(self, stage: str, artifact: Path) -> bool:
         sidecar = Path(f"{artifact}.inputs")
@@ -260,37 +264,42 @@ class Freezer:
             if n < 300:
                 sys.exit("[freeze] still fewer than 300 bursts stories at 240 s: stop and report")
 
+    def reference_path(self) -> Path:
+        return Path(need_env("NEWS_SIGNAL_DATA")) / REFERENCE_FILE
+
+    def require_clean(self) -> None:
+        if git("status", "--porcelain", "--", "serving", "infosys"):
+            sys.exit("[freeze] serving/ or infosys/ has uncommitted changes: the baseline must be the committed tree")
+
     def cpu_acc(self) -> dict:
-        out = self.runs / "cpu-acc.json"
-        if self.todo("cpu-acc", out):
-            say("CPU dry run of the accuracy checker (long)")
+        out, ref = self.runs / "cpu-acc.json", self.reference_path()
+        if self.todo("cpu-acc", out) or not ref.exists():
+            self.require_clean()  # the reference is the committed baseline's, not an edited tree's
+            say("CPU run of the baseline over every validation story: reference signals and IC by horizon (long)")
             uv_run(str(TASK / "accuracy_checker" / "checker.py"), "--report", "--device", "cpu", "--drain-s", "1800",
-                   "--horizons", ",".join(map(str, HORIZONS)), "--json-out", str(out))  # fmt: skip
+                   "--horizons", ",".join(map(str, HORIZONS)), "--write-reference", str(ref), "--json-out", str(out))  # fmt: skip
             self.stamp(out, full=False)
+        raw = ref.read_bytes()
+        pairs = len(gzip.decompress(raw).splitlines())
+        set_toml(GATE, "reference_sha256", toml_str(hashlib.sha256(raw).hexdigest()), section="baseline")
+        set_toml(GATE, "reference_pairs", str(pairs), section="baseline")
+        say(f"reference: {pairs} pairs, sha256 {hashlib.sha256(raw).hexdigest()[:12]}... pinned in gate.toml")
         return json.loads(out.read_text())
 
-    def pick_h(self) -> None:
-        horizons = self.cpu_acc()["horizons"]
-        for h in HORIZONS:
-            r = horizons[str(h)]
-            if r["ic"] is not None and r["ic_se"] is not None and r["ic"] - 2 * r["ic_se"] > 0:
-                reason = f"{h} min: ic {r['ic']:.3f}, 2se {2 * r['ic_se']:.3f}"
-                set_toml(GATE, "h_minutes", str(h))
-                set_toml(GATE, "h_reason", toml_str(reason))
-                say(f"H = {reason}")
-                return
-        sys.exit("[freeze] no horizon has ic - 2*se > 0 on the CPU run: the universe must widen (new data pull)")
-
-    def sizing(self) -> None:
-        cap = min(30000, int(REPLAY_BUDGET_S / (MS_PER_HEADLINE / 1000)))
-        PASSRUN.write_text(re.sub(r"^MAX_STORIES = \d+", f"MAX_STORIES = {cap}", PASSRUN.read_text(), flags=re.M))
-        say(f"MAX_STORIES = {cap}")
+    def fix_h(self) -> None:
+        """IC decides nothing, so H is fixed; the table is printed for the record."""
+        for h, r in self.cpu_acc()["horizons"].items():
+            ic, se = r["ic"], r["ic_se"]
+            say(f"IC@{h} min: " + ("n/a" if ic is None else f"{ic:+.4f}") + (" se n/a" if se is None else f" (se {se:.4f})")
+                + f", {r['scored_pairs']} scored pairs")  # fmt: skip
+        set_toml(GATE, "h_minutes", str(H_MINUTES))
+        set_toml(GATE, "h_reason", toml_str(f"fixed at {H_MINUTES} min: IC is record only (see cpu-acc.json for the table)"))
+        say(f"H = {H_MINUTES}")
 
     # -- GPU stages -------------------------------------------------------------------------------
 
     def sync(self, *, data: bool = True) -> None:
-        if git("status", "--porcelain", "--", "serving", "infosys"):
-            sys.exit("[freeze] serving/ or infosys/ has uncommitted changes: the baseline must be the committed tree")
+        self.require_clean()
         host, camp = need_env("NS_GPU_SSH"), need_env("NS_CAMP")
         sh(["rsync", "-a", "--delete", "--exclude", ".git", "--exclude", ".venv", f"{ROOT}/", f"{host}:{camp}/news-signal/"])
         if data:
@@ -383,6 +392,16 @@ class Freezer:
                 f"{sc['invalid']} invalid, valid={sc['valid']}. Do not change the gate sample; raise the job time "
                 f"limit if it ran short, then rerun with --force f1"
             )
+        gate = tomllib.loads(GATE.read_text())
+        fid = res.get("fidelity")
+        if not fid or fid["spearman"] is None:
+            sys.exit("[freeze] the baseline accuracy pass has no fidelity against the CPU reference: rerun with --force f1")
+        if fid["agreement"] < gate["agreement_floor"] or fid["spearman"] < gate["spearman_floor"]:
+            sys.exit(
+                f"[freeze] the GPU baseline does not reproduce the CPU reference: agreement {fid['agreement']:.4f} "
+                f"(floor {gate['agreement_floor']}), spearman {fid['spearman']:.4f} (floor {gate['spearman_floor']}). "
+                f"That is a reference or hardware mismatch: stop and report; do not change the floors"
+            )
         return res
 
     def f2(self) -> list[dict]:
@@ -416,6 +435,10 @@ class Freezer:
             over = [f"{k} {lag[k]:.1f} ms > {bound} ms" for k, bound in SEND_LAG_MAX_MS.items() if lag[k] > bound]
             if over:
                 sys.exit(f"[freeze] {p.name}: invalid pass, send lag {', '.join(over)}")
+            agree = last["values"].get("direction_agreement")
+            require_finite(**{f"{p.name} direction_agreement": agree})
+            if agree < tomllib.loads(GATE.read_text())["agreement_floor"]:  # recorded, not enforced: a short pass
+                say(f"WARNING {p.name}: bursts agreement {agree:.4f} is below the gate floor")
             if last["values"].get("reruns"):
                 say(f"{p.name}: the first pass was invalid (send lag), the rerun is the result")
             results.append(last["values"])
@@ -434,16 +457,23 @@ class Freezer:
         p1, p2 = r1.get("p99_latency_ms"), r2.get("p99_latency_ms")
         b1, b2 = r1.get("ic"), r2.get("ic")
         require_finite(ic=ic, ic_se=se, p99_a=p1, p99_b=p2, bursts_ic_a=b1, bursts_ic_b=b2)
-        floor, noise = derive(ic, se, p1, p2)
+        noise = relative_noise(p1, p2)
         bursts_ic = (b1 + b2) / 2
+        fid = f1["fidelity"]
+        a1, a2 = r1["direction_agreement"], r2["direction_agreement"]
+        gate_now_top = tomllib.loads(GATE.read_text())
+        gate_now = gate_now_top["baseline"]
+        if not re.fullmatch(r"[0-9a-f]{64}", gate_now["reference_sha256"]):
+            sys.exit("[freeze] gate.toml has no pinned reference digest: run the cpu-acc stage first")
         head = git("rev-parse", "--short", "HEAD")
         other = [ln for ln in git("status", "--porcelain", "--", ".vibesys").splitlines()
                  if Path(ln[3:]).name not in TASK_OUTPUTS | {"passrun.py"}]
         dirty_note = f"; uncommitted task files: {len(other)}" if other else ""
-        for key, val in (("frozen", "true"), ("ic", repr(ic)), ("ic_se", repr(se)), ("ic_floor", repr(floor)),
+        for key, val in (("frozen", "true"), ("ic", repr(ic)), ("ic_se", repr(se)),
                          ("bursts_ic", repr(bursts_ic)), ("validation_stories", str(s["stories"])),
                          ("scored_pairs", str(s["scored_pairs"])), ("p99_ms", f"[{p1!r}, {p2!r}]"),
-                         ("ms_per_headline", repr(MS_PER_HEADLINE))):  # fmt: skip
+                         ("f1_agreement", repr(fid["agreement"])), ("f1_spearman", repr(fid["spearman"])),
+                         ("bursts_agreement", f"[{a1!r}, {a2!r}]")):  # fmt: skip
             set_toml(GATE, key, val, section="baseline")
         GATE.write_text(re.sub(
             r"\A(?:#[^\n]*\n)+", "# Frozen by scripts/freeze_baseline.py from the unmodified serving/ on the target GPU.\n",
@@ -474,9 +504,13 @@ class Freezer:
             f"Unmodified `serving/` (plain FinBERT, one headline per call) at commit `{head}` on 1x MI210, "
             f"validation split, H = {tomllib.loads(GATE.read_text())['h_reason']}. "
             f"`serving/` tree {tree_hash(ROOT / 'serving')[:12]}, task files {task_hash()[:12]}{dirty_note}.\n\n"
-            f"- Accuracy: IC {ic:.4f} (se {se:.4f}) on {s['stories']} stories, {s['scored_pairs']} scored pairs; "
-            f"gate floor `ic_floor` = {floor}.\n"
-            f"- Bursts: IC {bursts_ic:.4f} (mean of two runs); p99 latency {p1:.1f} ms and {p2:.1f} ms "
+            f"- Quality gate: agree with the original FinBERT (fp32, CPU) on at least {gate_now_top['agreement_floor']:.0%} of "
+            f"hidden validation pairs, with a signal Spearman of at least {gate_now_top['spearman_floor']}. Reference: "
+            f"{gate_now['reference_pairs']} pairs, sha256 `{gate_now['reference_sha256'][:12]}`. Baseline GPU accuracy "
+            f"pass: agreement {fid['agreement']:.4f}, Spearman {fid['spearman']:.4f}. Baseline bursts passes: "
+            f"agreement {a1:.4f} and {a2:.4f}.\n"
+            f"- Accuracy IC (record only): {ic:.4f} (se {se:.4f}) on {s['stories']} stories, {s['scored_pairs']} scored pairs.\n"
+            f"- Bursts: IC {bursts_ic:.4f} (record only, mean of two runs); p99 latency {p1:.1f} ms and {p2:.1f} ms "
             f"(p50 {r1['p50_latency_ms']:.1f} and {r2['p50_latency_ms']:.1f} ms; {r1['stories']:.0f} stories). "
             f"Pareto `relative_noise` = {noise}.\n\n"
             "### Baseline (record only)\n\n"
@@ -487,7 +521,9 @@ class Freezer:
         md = OBJECTIVE_MD.read_text()
         OBJECTIVE_MD.write_text(md[: md.index("## Baseline")] + section)
         say(f"frozen at commit {head}:")
-        print(json.dumps({"ic": ic, "ic_se": se, "ic_floor": floor, "bursts_ic": bursts_ic,
+        print(json.dumps({"ic": ic, "ic_se": se, "bursts_ic": bursts_ic,
+                          "f1_agreement": fid["agreement"], "f1_spearman": fid["spearman"],
+                          "bursts_agreement": [a1, a2], "reference_pairs": gate_now["reference_pairs"],
                           "validation_stories": s["stories"], "scored_pairs": s["scored_pairs"],
                           "p99_ms": [p1, p2], "relative_noise": noise,
                           "record_only": {"f1": extra[0], "f2": extra[1:]}}, indent=2))  # fmt: skip
@@ -500,8 +536,8 @@ def main() -> None:
     a = p.parse_args()
     runs = Path(os.environ.get("NS_RUNS", Path.home() / "ns-runs"))
     f = Freezer(runs, set(filter(None, a.force.split(","))))
-    steps = {"manifest": f.manifest, "pin": f.pin, "budget": f.budget, "cpu-acc": f.cpu_acc, "h": f.pick_h,
-             "sizing": f.sizing, "sync": f.sync, "probe": f.probe, "f1": f.f1, "f2": f.f2, "freeze": f.freeze}  # fmt: skip
+    steps = {"manifest": f.manifest, "pin": f.pin, "budget": f.budget, "cpu-acc": f.cpu_acc, "h": f.fix_h,
+             "sync": f.sync, "probe": f.probe, "f1": f.f1, "f2": f.f2, "freeze": f.freeze}  # fmt: skip
     unknown = set(a.stages.split(",")) - steps.keys()
     if unknown:
         sys.exit(f"[freeze] unknown stage {sorted(unknown)[0]}")

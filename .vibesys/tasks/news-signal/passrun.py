@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from infosys.newsd import PassLog
     from infosys.replay import ReplayPlan
-    from infosys.score import PassScore
+    from infosys.score import Fidelity, PassScore
     from infosys.store import Bars, Split, Story
 
 TASK = Path(__file__).resolve().parent
@@ -42,7 +42,7 @@ ROOT = TASK.parents[2]
 GATE_PATH = TASK / "gate.toml"
 MANIFEST_PATH = TASK / "data.manifest.json"
 
-MAX_STORIES = 30000  # accuracy pass size; MAX_STORIES * ms_per_headline must stay under ~360 s
+MAX_STORIES = 30000  # accuracy pass size; at the baseline's ~8.5 ms per headline the replay must stay under ~360 s
 BURSTS_WINDOW_S = 300
 BURSTS_GAP_CAP_S = 0.25  # real gaps have a ~10 min median; 0.25 s is still ~30x the per-story service time, so stories do not overlap
 BURSTS_BUDGET_S = 180.0  # raise to 240 only if the real data gives fewer than 300 measured stories
@@ -65,6 +65,7 @@ class Mode(StrEnum):
     BURSTS = "bursts"
     ACCURACY = "accuracy"
     SMOKE = "smoke"
+    REFERENCE = "reference"  # every validation story, to write the reference signals (CPU, freeze only)
 
 
 class PassError(Exception):
@@ -108,6 +109,7 @@ SETTINGS: dict[Mode, PassSettings] = {
     Mode.BURSTS: PassSettings(_bursts, BURSTS_GAP_CAP_S, 1, 10.0, 600.0, 64, 10.0),
     Mode.ACCURACY: PassSettings(_accuracy, 0.01, 2, 600.0, 600.0, 64, 10.0),
     Mode.SMOKE: PassSettings(_all, 0.05, 3, 5.0, 120.0, 16, 20.0),
+    Mode.REFERENCE: PassSettings(_all, 0.01, 2, 1800.0, 600.0, 64, 10.0),
 }
 
 
@@ -121,18 +123,23 @@ _GATE_KEYS = {
     "max_missed_frac": float,
     "max_duplicate_frac": float,
     "max_invalid": int,
+    "agreement_floor": float,
+    "spearman_floor": float,
     "baseline": dict,
 }
 _BASELINE_KEYS = {
     "frozen": bool,
     "ic": float,
     "ic_se": float,
-    "ic_floor": float,
     "bursts_ic": float,
     "validation_stories": int,
     "scored_pairs": int,
     "p99_ms": list,
-    "ms_per_headline": float,
+    "reference_sha256": str,
+    "reference_pairs": int,
+    "f1_agreement": float,
+    "f1_spearman": float,
+    "bursts_agreement": list,
 }
 
 
@@ -151,8 +158,9 @@ def load_gate() -> dict:
                 ok = False
             if not ok:
                 raise PassError(f"gate.toml: {key} must be {kind.__name__}")
-    if len(gate["baseline"]["p99_ms"]) != 2:
-        raise PassError("gate.toml: baseline.p99_ms must have two entries")
+    for key in ("p99_ms", "bursts_agreement"):
+        if len(gate["baseline"][key]) != 2:
+            raise PassError(f"gate.toml: baseline.{key} must have two entries")
     return gate
 
 
@@ -221,6 +229,74 @@ def _trust_infosys(root: Path, gate: dict) -> None:
         )
     if "infosys" not in sys.modules and str(root) not in sys.path:
         sys.path.insert(0, str(root))
+
+
+# -- the hidden reference signals ------------------------------------------------------------------------
+
+REFERENCE_FILE = "reference/validation.jsonl.gz"  # under the scoring data directory, so the namespace hides it
+
+
+def _data_dir(data_dir: Path | None) -> Path:
+    if data_dir is not None:
+        return data_dir
+    env_dir = os.environ.get("NEWS_SIGNAL_DATA")
+    if not env_dir:
+        raise PassError("NEWS_SIGNAL_DATA is not set")
+    return Path(env_dir)
+
+
+def write_reference(path: Path, plan: ReplayPlan, log: PassLog) -> int:
+    """Write one line per measured pair with the baseline's first signal; returns the pair count.
+
+    Refuses (writing nothing) unless every pair has a signal and none was rejected: a hole would silently become a
+    disagreement for every candidate. Gzip with mtime 0, so equal signals give an equal digest."""
+    from infosys.score import first_signals
+
+    first, _ = first_signals(plan, log)
+    pairs = [(s.story_id, t) for s in plan.measured for t in s.tickers]
+    lost = sum(p not in first for p in pairs)
+    if lost or sum(log.invalid.values()) or log.schema_errors:
+        raise PassError(f"the reference pass is incomplete: {lost} pairs without a signal, "
+                        f"{sum(log.invalid.values()) + log.schema_errors} rejected")
+    lines = [json.dumps({"story_id": k[0], "ticker": k[1], "direction": first[k].direction,
+                         "confidence": first[k].confidence}) + "\n" for k in pairs]  # fmt: skip
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+        gz.write("".join(lines).encode())
+    return len(lines)
+
+
+def load_reference(gate: dict, data_dir: Path | None = None) -> dict[tuple[str, str], float]:
+    """(story_id, ticker) -> direction * confidence of the baseline. Fails closed: the file must exist, match the
+    sha256 pinned in gate.toml and parse; messages carry no path or content."""
+    try:
+        raw = (_data_dir(data_dir) / REFERENCE_FILE).read_bytes()
+    except OSError:
+        raise PassError("the reference signals are missing from the scoring data") from None
+    if hashlib.sha256(raw).hexdigest() != gate["baseline"]["reference_sha256"]:
+        raise PassError("the reference signals differ from the digest pinned in gate.toml")
+    try:
+        out: dict[tuple[str, str], float] = {}
+        for line in gzip.decompress(raw).decode().splitlines():
+            rec = json.loads(line)
+            direction, confidence = rec["direction"], float(rec["confidence"])
+            if direction not in (-1, 0, 1) or not 0.0 <= confidence <= 1.0:
+                raise ValueError
+            out[(rec["story_id"], rec["ticker"])] = direction * confidence
+    except (OSError, ValueError, KeyError, TypeError, EOFError):
+        raise PassError("the reference signals are malformed") from None
+    if not out:
+        raise PassError("the reference signals are empty")
+    return out
+
+
+def score_fidelity(result: PassResult, reference: dict[tuple[str, str], float]) -> Fidelity:
+    from infosys.score import fidelity
+
+    try:
+        return fidelity(result.plan, result.log, reference)
+    except ValueError:
+        raise PassError("the reference signals do not cover every pair of this pass") from None
 
 
 # -- subprocess helpers ---------------------------------------------------------------------------------
@@ -585,11 +661,7 @@ def run_pass(
         data_dir = root / "infosys" / "fixtures" / "tiny"
         manifest_path = data_dir / "manifest.json"
     else:
-        if data_dir is None:
-            env_dir = os.environ.get("NEWS_SIGNAL_DATA")
-            if not env_dir:
-                raise PassError("NEWS_SIGNAL_DATA is not set")
-            data_dir = Path(env_dir)
+        data_dir = _data_dir(data_dir)
         manifest_path = MANIFEST_PATH
     try:
         pinned = json.loads(manifest_path.read_text())

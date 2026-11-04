@@ -7,7 +7,7 @@ from hypothesis import strategies as st
 
 from infosys.newsd import PassLog, ReceivedSignal
 from infosys.replay import ReplayPlan
-from infosys.score import MAX_SEND_LAG_P90_MS, MAX_SEND_LAG_P99_MS, score_pass
+from infosys.score import MAX_SEND_LAG_P90_MS, MAX_SEND_LAG_P99_MS, fidelity, score_pass
 from infosys.store import Bars, Story
 
 P = datetime(2024, 3, 11, 14, 0, tzinfo=UTC)  # 10:00 EDT
@@ -193,3 +193,65 @@ def test_per_feed_first_counts_sum_to_the_stories_sent(offsets):
     assert feeds["x"]["first"] + feeds["y"]["first"] == len(stories)
     assert feeds["x"]["pairs"] == feeds["y"]["pairs"] == len(stories)
     assert feeds["x"]["first"] == sum(a <= b for a, b in offsets)
+
+
+# -- fidelity to a reference signal set ------------------------------------------------------------------
+
+
+def _fid_case(n: int, flips: int = 0, skip: int = 0, scale: float = 1.0):
+    """n pairs whose reference signal is a strictly increasing ramp over both signs; the candidate repeats it, except
+    `flips` pairs with the opposite direction and `skip` pairs with no signal at all."""
+    stories = [_story(i, (f"T{i:02d}",)) for i in range(n)]
+    ref = {(f"s{i}", f"T{i:02d}"): (i - n / 2 + 0.25) / n for i in range(n)}  # never exactly 0
+    signals = []
+    for i in range(skip, n):
+        r = ref[(f"s{i}", f"T{i:02d}")]
+        direction = (1 if r > 0 else -1) * (-1 if skip <= i < skip + flips else 1)
+        signals.append(_sig(f"s{i}", f"T{i:02d}", direction=direction, confidence=abs(r) * scale))
+    return _plan(stories, [1.0] * n), _log(signals), ref
+
+
+def test_fidelity_is_perfect_for_the_reference_itself():
+    f = fidelity(*_fid_case(50))
+    assert (f.pairs, f.agreed, f.agreement, f.both) == (50, 50, 1.0, 50) and f.spearman == pytest.approx(1.0)
+
+
+def test_fidelity_counts_flips_and_missed_pairs_as_disagreement():
+    f = fidelity(*_fid_case(100, flips=3, skip=0))
+    assert f.agreement == 0.97 and f.both == 100
+    f = fidelity(*_fid_case(100, skip=2))
+    assert (f.agreed, f.pairs, f.both) == (98, 100, 98) and f.agreement == 0.98
+
+
+@given(n=st.integers(40, 120), data=st.data())
+def test_fidelity_agreement_is_the_agreeing_fraction(n, data):
+    flips = data.draw(st.integers(0, n // 2))
+    skip = data.draw(st.integers(0, n // 4))
+    f = fidelity(*_fid_case(n, flips=flips, skip=skip))
+    assert f.agreement == (n - skip - flips) / n and f.pairs == n
+
+
+def test_fidelity_spearman_ignores_a_monotone_rescale_and_sees_a_constant_confidence():
+    assert fidelity(*_fid_case(60, scale=0.5)).spearman == pytest.approx(1.0)
+    plan, log, ref = _fid_case(60)
+    constant = _log([_sig(g.story_id, g.ticker, direction=g.direction, confidence=0.9) for g in log.signals])
+    f = fidelity(plan, constant, ref)
+    assert f.agreement == 1.0 and f.spearman is not None and f.spearman < 0.95
+
+
+def test_fidelity_neutral_agrees_only_with_neutral():
+    stories = [_story(i, (f"T{i:02d}",)) for i in range(40)]
+    ref = {(f"s{i}", f"T{i:02d}"): 0.0 if i < 10 else 0.5 + i / 100 for i in range(40)}
+    signals = [_sig(f"s{i}", f"T{i:02d}", direction=0 if i < 9 else 1, confidence=0.9) for i in range(40)]
+    f = fidelity(_plan(stories, [1.0] * 40), _log(signals), ref)
+    assert f.agreed == 39  # pair 9 is a reference neutral that the candidate called positive
+    zero_conf = [_sig(f"s{i}", f"T{i:02d}", direction=1, confidence=0.0 if i < 10 else 0.9) for i in range(40)]
+    assert fidelity(_plan(stories, [1.0] * 40), _log(zero_conf), ref).agreed == 40  # confidence 0 is neutral
+
+
+def test_fidelity_ignores_duplicates_and_unmeasured_signals_and_refuses_an_uncovered_pair():
+    plan, log, ref = _fid_case(40)
+    extra = _log([*log.signals, _sig("s0", direction=-1, received=5.0), _sig("nope", "ZZZ")])
+    assert fidelity(plan, extra, ref).agreement == 1.0  # the later duplicate and the foreign signal do not count
+    with pytest.raises(ValueError, match="not in the reference"):
+        fidelity(plan, log, {k: v for k, v in ref.items() if k != ("s3", "T03")})

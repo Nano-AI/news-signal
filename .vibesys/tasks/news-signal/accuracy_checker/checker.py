@@ -1,7 +1,9 @@
-"""Accuracy gate: replay a validation sample through the candidate and compare its IC with the baseline.
+"""Accuracy gate: replay a validation sample through the candidate and compare its signals with the baseline FinBERT's.
 
-Gate mode (no --report) passes only if the pass is valid, the baseline is frozen, IC holds the frozen floor, and
-missed, duplicate and invalid counts stay within the gate. --report prints the numbers and always exits 0.
+Gate mode (no --report) passes only if the pass is valid, the baseline is frozen, the signals agree with the hidden
+reference (direction agreement and signal Spearman at their frozen floors), and missed, duplicate and invalid counts
+stay within the gate. IC is printed and recorded, never decided on. --report prints the numbers and always exits 0.
+--write-reference PATH (freeze only, with --report) replays every validation story and writes the reference there.
 """
 
 from __future__ import annotations
@@ -14,7 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # passrun
 
-from passrun import Mode, PassError, load_gate, rescore, run_pass  # noqa: E402
+from passrun import (  # noqa: E402
+    Mode, PassError, load_gate, load_reference, rescore, run_pass, score_fidelity, write_reference,
+)
 
 
 def _fmt(value: float | None, digits: int = 4) -> str:
@@ -24,15 +28,19 @@ def _fmt(value: float | None, digits: int = 4) -> str:
 NOT_FROZEN = "baseline is not frozen (gate.toml baseline.frozen = false)"
 
 
-def evaluate_gate(score, gate: dict) -> str | None:
-    """The first failing check as a message, or None if the gate passes."""
+def evaluate_gate(score, gate: dict, fid) -> str | None:
+    """The first failing check as a message, or None if the gate passes. `fid` is the pass's Fidelity (or None)."""
     base = gate["baseline"]
     if not base["frozen"]:
         return NOT_FROZEN
     if not score.valid:
         return f"invalid pass: {score.invalid_reason}"
-    if score.ic is None or score.ic < base["ic_floor"]:
-        return f"ic {_fmt(score.ic)} is below the floor {base['ic_floor']}"
+    if fid is None:
+        return "agreement with the reference signals could not be computed"
+    if fid.agreement < gate["agreement_floor"]:
+        return f"direction agreement {_fmt(fid.agreement)} is below the floor {gate['agreement_floor']}"
+    if fid.spearman is None or fid.spearman < gate["spearman_floor"]:
+        return f"signal spearman {_fmt(fid.spearman)} is below the floor {gate['spearman_floor']}"
     if score.missed > gate["max_missed_frac"] * score.pairs:
         return f"missed {score.missed} of {score.pairs} pairs exceeds {gate['max_missed_frac']}"
     if score.duplicates > gate["max_duplicate_frac"] * score.pairs:
@@ -50,9 +58,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--drain-s", type=float)
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--json-out", type=Path)
+    p.add_argument("--write-reference", type=Path)
     a = p.parse_args(argv)
     if not a.report and (a.drain_s is not None or a.horizons is not None or a.split != "validation"):
         print("FAIL: gate mode refuses --drain-s, --horizons and a holdout split (use --report)")
+        return 1
+    if a.write_reference and (not a.report or a.split != "validation"):
+        print("FAIL: --write-reference needs --report and the validation split")
         return 1
     try:
         horizons = [int(h) for h in a.horizons.split(",")] if a.horizons else None
@@ -64,7 +76,19 @@ def main(argv: list[str] | None = None) -> int:
         if not a.report and not gate["baseline"]["frozen"]:
             print(f"FAIL: {NOT_FROZEN}")
             return 1
-        result = run_pass(Mode.ACCURACY, a.split, device=a.device, drain_s=a.drain_s)
+        reference = None
+        if a.split == "validation" and not a.write_reference:  # the gate needs it; a report shows it when it can
+            try:
+                reference = load_reference(gate)
+            except PassError as e:
+                if not a.report:
+                    raise
+                print(f"fidelity: n/a ({e.message})")
+        result = run_pass(Mode.REFERENCE if a.write_reference else Mode.ACCURACY, a.split, device=a.device,
+                          drain_s=a.drain_s)  # fmt: skip
+        fid = score_fidelity(result, reference) if reference else None
+        if a.write_reference:
+            print(f"reference: wrote {write_reference(a.write_reference, result.plan, result.log)} pairs")
     except PassError as e:
         print(e.message)
         return 1
@@ -75,6 +99,9 @@ def main(argv: list[str] | None = None) -> int:
         f"ic_se={_fmt(s.ic_se)} hit_rate={_fmt(s.hit_rate)} missed={s.missed} duplicates={s.duplicates} "
         f"invalid={s.invalid}"
     )
+    if fid is not None:
+        print(f"fidelity: agreement={_fmt(fid.agreement)} spearman={_fmt(fid.spearman)} pairs={fid.pairs} "
+              f"signalled={fid.both}")  # fmt: skip
     per_horizon = {}
     for h in horizons or [gate["h_minutes"]]:
         hs = s if h == gate["h_minutes"] else rescore(result, h)
@@ -102,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "score": asdict(s),
+                    "fidelity": asdict(fid) if fid else None,
                     "horizons": per_horizon,
                     "serve": asdict(sv),
                     "first_pass": asdict(result.first_invalid) if result.first_invalid else None,
@@ -112,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     if a.report:
         return 0
-    failure = evaluate_gate(s, gate)
+    failure = evaluate_gate(s, gate, fid)
     print("PASS" if failure is None else f"FAIL: {failure}")
     return 0 if failure is None else 1
 

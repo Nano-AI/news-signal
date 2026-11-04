@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # passrun
 
-from passrun import Mode, PassError, load_gate, run_pass  # noqa: E402
+from passrun import Mode, PassError, load_gate, load_reference, run_pass, score_fidelity  # noqa: E402
 
 HELLO = {
     "kind": "hello",
@@ -39,6 +39,8 @@ HELLO = {
         "reruns": {"direction": "min", "required": False},
         "first_pass_send_lag_p90_ms": {"unit": "ms", "required": False},
         "first_pass_send_lag_p99_ms": {"unit": "ms", "required": False},
+        "direction_agreement": {"direction": "max", "required": False},
+        "signal_spearman": {"direction": "max", "required": False},
         "ic": {"direction": "max", "required": False},
         "ic_se": {"required": False},
     },
@@ -60,25 +62,25 @@ def _partial_p99(p99: float | None) -> dict | None:
     return {"name": "p99_latency_ms", "value": p99, "direction": "min", "unit": "ms"}
 
 
-IC_SE_MARGIN = 3.0
-
-
-def quality_failure(score, gate: dict, directions: set[int]) -> str | None:
-    """A degenerate or much worse signal set fails the benchmark, so a fast model that predicts nothing cannot win."""
+def quality_failure(fid, gate: dict, directions: set[int], need_fidelity: bool = True) -> str | None:
+    """A degenerate signal set, or one that departs from the baseline FinBERT's, fails the benchmark, so a fast
+    model that predicts nothing cannot win. `fid` is the pass's Fidelity against the hidden reference."""
     if len(directions) < 2:
         return f"the signals use {len(directions)} direction(s); a real model emits at least two"
-    base = gate["baseline"]
-    if not base["frozen"]:
-        return None  # the baseline run that freezes bursts_ic
-    if score.ic is None:
-        return "ic is undefined on the bursts pass"
-    bound = base["bursts_ic"] - IC_SE_MARGIN * (score.ic_se or 0.0)
-    if score.ic < bound:
-        return f"ic {score.ic:.4f} is below the baseline {base['bursts_ic']:.4f} minus {IC_SE_MARGIN:g} se"
+    if not gate["baseline"]["frozen"]:
+        return None  # the baseline runs that freeze: their agreement is recorded, nothing is enforced
+    if fid is None:
+        return "agreement with the reference signals could not be computed" if need_fidelity else None
+    if fid.agreement < gate["agreement_floor"]:
+        return f"direction agreement {fid.agreement:.4f} is below the floor {gate['agreement_floor']}"
+    if fid.spearman is None or fid.spearman < gate["spearman_floor"]:
+        sp = "undefined" if fid.spearman is None else f"{fid.spearman:.4f}"
+        return f"signal spearman {sp} is below the floor {gate['spearman_floor']}"
     return None
 
 
-def records_for(score, gate: dict, directions: set[int], first_invalid=None, serve=None) -> list[dict]:
+def records_for(score, gate: dict, directions: set[int], first_invalid=None, serve=None, fid=None,
+                need_fidelity=True) -> list[dict]:
     """HELLO plus one result, or an error naming the first failing check and carrying the p99 reached.
 
     Result protocol 2 has no details map: a result row holds only finite numbers under metrics declared in HELLO,
@@ -99,7 +101,7 @@ def records_for(score, gate: dict, directions: set[int], first_invalid=None, ser
             return [HELLO, error_record(f"{name} {count} exceeds the gate ({limit:g})", partial=partial)]
     if lat["p99"] is None:
         return [HELLO, error_record("the pass produced no latency samples")]
-    failure = quality_failure(score, gate, directions)
+    failure = quality_failure(fid, gate, directions, need_fidelity)
     if failure:
         return [HELLO, error_record(f"prediction quality: {failure}", partial=partial)]
     values = {
@@ -125,7 +127,11 @@ def records_for(score, gate: dict, directions: set[int], first_invalid=None, ser
         values["first_pass_send_lag_p99_ms"] = first_invalid.send_lag_ms["p99"]
     else:
         values["reruns"] = 0
-    if score.ic is not None:
+    if fid is not None:
+        values["direction_agreement"] = fid.agreement
+        if fid.spearman is not None:
+            values["signal_spearman"] = fid.spearman
+    if score.ic is not None:  # record only
         values["ic"] = score.ic
     if score.ic_se is not None:
         values["ic_se"] = score.ic_se
@@ -161,9 +167,18 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     try:
         gate = load_gate()
+        reference = None
+        if a.split == "validation":  # the reference covers the validation stories only
+            try:
+                reference = load_reference(gate)
+            except PassError:
+                if gate["baseline"]["frozen"]:
+                    raise  # fail closed once the gate is live; before the freeze there is nothing to compare with
         result = run_pass(Mode.BURSTS, a.split, device=a.device)
+        fid = score_fidelity(result, reference) if reference else None
         records = records_for(result.score, gate, {sig.direction for sig in result.log.signals}, result.first_invalid,
-                              result.serve)
+                              result.serve, fid,
+                              a.split == "validation")
     except PassError as e:
         records = [HELLO, error_record(e.message, requirement=e.requirement)]
     except Exception as e:  # the stream must exist; the type alone, since messages can carry data text

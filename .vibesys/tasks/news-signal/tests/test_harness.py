@@ -27,7 +27,7 @@ import run as bench  # noqa: E402
 from passrun import Mode, PassError  # noqa: E402
 from tiny_model import build_tiny_model  # noqa: E402
 
-from infosys.score import PassScore  # noqa: E402
+from infosys.score import Fidelity, PassScore  # noqa: E402
 
 BOUND_S = 300  # only guards against hangs
 
@@ -56,11 +56,19 @@ def _score(**kw) -> PassScore:
 DIRS = {-1, 0, 1}
 
 
-def _gate(frozen=True, floor=0.03) -> dict:
+def _gate(frozen=True) -> dict:
     return {
         "max_missed_frac": 0.001, "max_duplicate_frac": 0.001, "max_invalid": 0,
-        "baseline": {"frozen": frozen, "ic_floor": floor, "bursts_ic": 0.05},
+        "agreement_floor": 0.99, "spearman_floor": 0.95,
+        "baseline": {"frozen": frozen, "bursts_ic": 0.05},
     }  # fmt: skip
+
+
+FID = Fidelity(pairs=1000, agreed=1000, agreement=1.0, both=1000, spearman=1.0)
+
+
+def _fid(agreement=1.0, spearman=1.0) -> Fidelity:
+    return Fidelity(pairs=1000, agreed=round(agreement * 1000), agreement=agreement, both=1000, spearman=spearman)
 
 
 # -- pins and gate file ---------------------------------------------------------------------------------
@@ -81,8 +89,11 @@ def test_gate_toml_complete():
     base = gate["baseline"]
     assert isinstance(base["frozen"], bool) and isinstance(base["bursts_ic"], float)
     assert all(isinstance(v, float) for v in base["p99_ms"]) and len(base["p99_ms"]) == 2
+    assert (gate["agreement_floor"], gate["spearman_floor"]) == (0.99, 0.95)
     if base["frozen"]:
-        assert base["ic_floor"] <= base["ic"] and base["validation_stories"] > 0 and base["scored_pairs"] > 0
+        assert len(base["reference_sha256"]) == 64 and base["reference_pairs"] > 0
+        assert base["f1_agreement"] >= gate["agreement_floor"] and base["f1_spearman"] >= gate["spearman_floor"]
+        assert min(base["bursts_agreement"]) > 0 and base["validation_stories"] > 0 and base["scored_pairs"] > 0
 
 
 def test_digest_ignores_caches_and_sees_edits(tmp_path):
@@ -215,21 +226,39 @@ def test_cpu_check_passes():
 
 @settings(deadline=None)
 @given(
-    ic=st.one_of(st.none(), st.floats(-0.2, 0.2)),
+    ic=st.one_of(st.none(), st.floats(-0.2, 0.2)), agreement=st.floats(0.9, 1.0),
+    spearman=st.one_of(st.none(), st.floats(0.8, 1.0)),
     missed=st.integers(0, 5), dup=st.integers(0, 5), invalid=st.integers(0, 2), valid=st.booleans(),
     frozen=st.booleans(),
 )  # fmt: skip
-def test_gate_passes_exactly_when_all_checks_hold(ic, missed, dup, invalid, valid, frozen):
+def test_gate_passes_exactly_when_all_checks_hold(ic, agreement, spearman, missed, dup, invalid, valid, frozen):
     score = _score(
         ic=ic, missed=missed, duplicates=dup, invalid=invalid, valid=valid,
         invalid_reason=None if valid else "send lag p90 9.0 ms exceeds 5.0 ms",
     )  # fmt: skip
-    expected = frozen and valid and ic is not None and ic >= 0.03 and missed <= 1 and dup <= 1 and invalid == 0
-    assert (checker.evaluate_gate(score, _gate(frozen=frozen)) is None) == expected
+    expected = (frozen and valid and agreement >= 0.99 and spearman is not None and spearman >= 0.95
+                and missed <= 1 and dup <= 1 and invalid == 0)  # fmt: skip
+    assert (checker.evaluate_gate(score, _gate(frozen=frozen), _fid(agreement, spearman)) is None) == expected
+
+
+def test_ic_decides_nothing_in_either_gate():
+    gate = _gate()
+    for ic in (None, -0.5, 0.0, 0.5):
+        assert checker.evaluate_gate(_score(ic=ic), gate, FID) is None
+        assert bench.records_for(_score(ic=ic), gate, DIRS, fid=FID)[-1]["kind"] == "result"
+
+
+def test_gate_names_the_failed_fidelity_check_and_a_missing_fidelity():
+    gate = _gate()
+    assert "direction agreement 0.9850 is below the floor 0.99" in checker.evaluate_gate(_score(), gate, _fid(0.985))
+    assert "signal spearman 0.9000 is below the floor 0.95" in checker.evaluate_gate(_score(), gate, _fid(1.0, 0.9))
+    assert "signal spearman n/a" in checker.evaluate_gate(_score(), gate, _fid(1.0, None))
+    assert "could not be computed" in checker.evaluate_gate(_score(), gate, None)
+    assert checker.evaluate_gate(_score(), gate, _fid(0.99, 0.95)) is None  # the floors are inclusive
 
 
 def test_gate_names_the_invalid_pass():
-    msg = checker.evaluate_gate(_score(valid=False, invalid_reason="send lag p90 9.0 ms exceeds 5.0 ms"), _gate())
+    msg = checker.evaluate_gate(_score(valid=False, invalid_reason="send lag p90 9.0 ms exceeds 5.0 ms"), _gate(), FID)
     assert msg is not None and "send lag" in msg
 
 
@@ -286,18 +315,18 @@ def _write(tmp_path, records) -> list[str]:
 
 def test_vs_output_records(tmp_path):
     gate = _gate()
-    ok = _check_stream(_write(tmp_path, bench.records_for(_score(), gate, DIRS)))
+    ok = _check_stream(_write(tmp_path, bench.records_for(_score(), gate, DIRS, fid=FID)))
     assert ok["kind"] == "result" and ok["values"]["p99_latency_ms"] == 20.0
     for bad in (
         _score(missed=5), _score(duplicates=5), _score(invalid=1),
         _score(valid=False, invalid_reason="send lag p90 9.0 ms exceeds 5.0 ms"),
         _score(latency_ms={"p50": None, "p90": None, "p99": None, "max": None}, missed=1000, signaled=0),
     ):  # fmt: skip
-        err = _check_stream(_write(tmp_path, bench.records_for(bad, gate, DIRS)))
+        err = _check_stream(_write(tmp_path, bench.records_for(bad, gate, DIRS, fid=FID)))
         assert err["kind"] == "error" and "error_kind" not in err
-    named = bench.records_for(_score(missed=5), gate, DIRS)[-1]
+    named = bench.records_for(_score(missed=5), gate, DIRS, fid=FID)[-1]
     assert named["message"].startswith("missed 5") and named["partial"]["value"] == 20.0
-    invalid = bench.records_for(_score(valid=False, invalid_reason="send lag"), gate, DIRS)[-1]
+    invalid = bench.records_for(_score(valid=False, invalid_reason="send lag"), gate, DIRS, fid=FID)[-1]
     assert "partial" not in invalid  # an invalid pass's p99 is not to be trusted
     req = bench.error_record("weights", requirement="no_weights_in_git")
     assert _check_stream(_write(tmp_path, [bench.HELLO, req]))["error_kind"] == "requirement_not_met"
@@ -308,7 +337,7 @@ def test_benchmark_main_turns_pass_error_into_record(tmp_path, monkeypatch):
         raise PassError("infosys/ differs", requirement="infosys_unchanged")
 
     monkeypatch.setattr(bench, "run_pass", boom)
-    monkeypatch.setattr(bench, "load_gate", _gate)
+    monkeypatch.setattr(bench, "load_gate", lambda: _gate(frozen=False))
     out = tmp_path / "o.jsonl"
     assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 1
     err = _check_stream(out.read_text().splitlines())
@@ -317,15 +346,29 @@ def test_benchmark_main_turns_pass_error_into_record(tmp_path, monkeypatch):
 
 def test_benchmark_quality_gate():
     gate = _gate()
-    assert bench.records_for(_score(), gate, {1})[-1]["message"].startswith("prediction quality")
-    low = bench.records_for(_score(ic=0.0, ic_se=0.01), gate, DIRS)[-1]
-    assert low["kind"] == "error" and "ic 0.0000" in low["message"] and low["partial"]["name"] == "p99_latency_ms"
-    assert bench.records_for(_score(ic=None), gate, DIRS)[-1]["kind"] == "error"
-    assert bench.records_for(_score(ic=0.05 - 2 * 0.01), gate, DIRS)[-1]["kind"] == "result"  # within 3 se
-    unfrozen = _gate(frozen=False)  # the baseline run that freezes bursts_ic
-    ok = bench.records_for(_score(ic=0.0), unfrozen, DIRS)[-1]
-    assert ok["kind"] == "result" and ok["values"]["ic"] == 0.0
-    assert bench.records_for(_score(), unfrozen, {0})[-1]["kind"] == "error"
+    assert bench.records_for(_score(), gate, {1}, fid=FID)[-1]["message"].startswith("prediction quality")
+    low = bench.records_for(_score(), gate, DIRS, fid=_fid(0.985))[-1]
+    assert low["kind"] == "error" and "direction agreement 0.9850" in low["message"]
+    assert low["partial"]["name"] == "p99_latency_ms"
+    assert bench.records_for(_score(), gate, DIRS, fid=_fid(1.0, 0.9))[-1]["message"].endswith("below the floor 0.95")
+    assert "undefined" in bench.records_for(_score(), gate, DIRS, fid=_fid(1.0, None))[-1]["message"]
+    assert "could not be computed" in bench.records_for(_score(), gate, DIRS)[-1]["message"]
+    assert bench.records_for(_score(), gate, DIRS, fid=_fid(0.995, 0.97))[-1]["kind"] == "result"
+    assert bench.records_for(_score(), gate, DIRS)[-1]["kind"] == "error"
+    # a holdout run has no reference: IC is information and nothing else is asked
+    assert bench.records_for(_score(), gate, DIRS, need_fidelity=False)[-1]["kind"] == "result"
+    unfrozen = _gate(frozen=False)  # the baseline runs that freeze: agreement is recorded, not enforced
+    ok = bench.records_for(_score(ic=0.0), unfrozen, DIRS, fid=_fid(0.5, 0.1))[-1]
+    assert ok["kind"] == "result" and ok["values"]["ic"] == 0.0 and ok["values"]["direction_agreement"] == 0.5
+    assert bench.records_for(_score(), unfrozen, {0}, fid=FID)[-1]["kind"] == "error"
+
+
+def test_benchmark_declares_and_reports_the_fidelity_metrics(tmp_path):
+    rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, fid=_fid(0.995, 0.97))))
+    assert (rec["values"]["direction_agreement"], rec["values"]["signal_spearman"]) == (0.995, 0.97)
+    assert bench.HELLO["metrics"]["direction_agreement"] == {"direction": "max", "required": False}
+    undefined = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(frozen=False), DIRS, fid=_fid(1.0, None))))
+    assert "signal_spearman" not in undefined["values"]  # absent, never null
 
 
 def test_benchmark_main_turns_any_exception_into_a_data_free_record(tmp_path, monkeypatch):
@@ -333,7 +376,7 @@ def test_benchmark_main_turns_any_exception_into_a_data_free_record(tmp_path, mo
         raise OSError("story text and /secret/path")
 
     monkeypatch.setattr(bench, "run_pass", boom)
-    monkeypatch.setattr(bench, "load_gate", _gate)
+    monkeypatch.setattr(bench, "load_gate", lambda: _gate(frozen=False))
     out = tmp_path / "o.jsonl"
     assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 1
     err = _check_stream(out.read_text().splitlines())
@@ -432,18 +475,28 @@ def freezer(repo, tmp_path):
     return module, module.Freezer(runs, set()), runs, repo
 
 
-def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0, sidecars=True):
+REF_SHA = "ab" * 32
+
+
+def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0, sidecars=True, agreement=0.9995,
+               spearman=0.9991, bursts_agreement=0.998, pinned=True):
+    if pinned:  # what the cpu-acc stage does once it has written the reference
+        gate = runs.parent / "repo" / ".vibesys" / "tasks" / "news-signal" / "gate.toml"
+        _FREEZE.set_toml(gate, "reference_sha256", f'"{REF_SHA}"', section="baseline")
+        _FREEZE.set_toml(gate, "reference_pairs", "22207", section="baseline")
     score = {"stories": 1000, "scored_pairs": 700, "ic": ic, "ic_se": 0.01, "missed": 0 if clean else 3,
              "duplicates": 0, "invalid": 0, "valid": True,
              "latency_ms": {"p50": 5.0, "p90": 9.0, "p99": 20.0, "max": 30.0}, "throughput_per_s": 50.0,
              "send_lag_ms": {"p50": 0.2, "p90": 0.3, "p99": 0.4, "max": 0.9},
              "feed_latency_ms": FEEDS_STATS if sidecars else {}}  # fmt: skip
     serve = {"cold_start_s": 12.5, "gpu_mem_idle_mib": 300.0, "gpu_mem_peak_mib": 4096.0} if sidecars else {}
-    (runs / "f1.json").write_text(json.dumps({"score": score, "serve": serve}))
+    fidelity = {"pairs": 1000, "agreed": 1000, "agreement": agreement, "both": 1000, "spearman": spearman}
+    (runs / "f1.json").write_text(json.dumps({"score": score, "serve": serve, "fidelity": fidelity}))
     (runs / "cpu-acc.json").write_text(json.dumps({"horizons": {}}))
     fz.stamp(runs / "f1.json")
     for i, p99 in enumerate((100.0, 104.0), start=1):
         values = {"p99_latency_ms": p99, "p50_latency_ms": 10.0, "stories": 300, "ic": bursts_ic,
+                  "direction_agreement": bursts_agreement, "signal_spearman": 0.99,
                   "newsd_send_lag_p50_ms": 0.7, "newsd_send_lag_p90_ms": lag_p90, "newsd_send_lag_p99_ms": 20.0,
                   "newsd_send_lag_max_ms": 25.0, "p90_latency_ms": 50.0, "max_latency_ms": 30.0,
                   "throughput_signals_per_s": 50.0}  # fmt: skip
@@ -467,12 +520,90 @@ def test_freeze_rewrites_task_files_idempotently(freezer):
 
     first = freeze()
     base = tomllib.loads(first["gate.toml"].decode())["baseline"]
-    assert base["frozen"] is True and base["ic_floor"] == 0.0212 and base["p99_ms"] == [100.0, 104.0]
+    assert base["frozen"] is True and base["p99_ms"] == [100.0, 104.0]
     assert base["bursts_ic"] == 0.03 and base["validation_stories"] == 1000 and base["scored_pairs"] == 700
+    assert (base["f1_agreement"], base["f1_spearman"], base["bursts_agreement"]) == (0.9995, 0.9991, [0.998, 0.998])
+    assert (base["reference_sha256"], base["reference_pairs"]) == (REF_SHA, 22207) and "ic_floor" not in base
+    assert "ms_per_headline" not in base
     assert b"PLACEHOLDER" not in first["gate.toml"]
     assert tomllib.loads(first["objectives.toml"].decode())["pareto"]["relative_noise"] == 0.04
-    assert b"IC 0.04" in first["OBJECTIVE.md"] and b"Pending" not in first["OBJECTIVE.md"] and b"commit `" in first["OBJECTIVE.md"]
+    assert b"agreement 0.9995, Spearman 0.9991" in first["OBJECTIVE.md"] and b"(record only): 0.04" in first["OBJECTIVE.md"]
+    assert b"Pending" not in first["OBJECTIVE.md"] and b"commit `" in first["OBJECTIVE.md"]
     assert freeze() == first
+
+
+def test_freeze_stops_when_the_gpu_baseline_does_not_reproduce_the_reference(freezer):
+    _, fz, runs, _ = freezer
+    for kw in ({"agreement": 0.985}, {"spearman": 0.9}, {"spearman": None}):
+        _artifacts(fz, runs, **kw)
+        with pytest.raises(SystemExit, match="reference|fidelity"):
+            fz.freeze()
+    _artifacts(fz, runs, agreement=0.99, spearman=0.95)  # the floors are inclusive
+    fz.freeze()
+
+
+def test_freeze_needs_the_pinned_reference_and_records_a_low_bursts_agreement(freezer, capsys):
+    _, fz, runs, _ = freezer
+    _artifacts(fz, runs, pinned=False)
+    with pytest.raises(SystemExit, match="no pinned reference digest"):
+        fz.freeze()
+    _artifacts(fz, runs, bursts_agreement=0.97)
+    fz.freeze()  # recorded and warned about, not a stop
+    assert "WARNING bench-1.jsonl: bursts agreement 0.9700" in capsys.readouterr().out
+
+
+def test_h_stage_fixes_h_and_never_stops_on_a_noise_level_ic(freezer, monkeypatch):
+    import tomllib
+
+    module, fz, runs, repo = freezer
+    bad = {str(h): {"ic": ic, "ic_se": 0.012, "scored_pairs": 9000} for h, ic in ((5, 0.007), (15, -0.013), (30, None), (60, -0.009))}
+    monkeypatch.setattr(fz, "cpu_acc", lambda: {"horizons": bad})
+    module.set_toml(repo / ".vibesys" / "tasks" / "news-signal" / "gate.toml", "h_minutes", "30")
+    fz.fix_h()
+    gate = tomllib.loads((repo / ".vibesys" / "tasks" / "news-signal" / "gate.toml").read_text())
+    assert gate["h_minutes"] == 5 and "record only" in gate["h_reason"]
+
+
+def test_there_is_no_sizing_stage_and_the_accuracy_replay_fits_its_budget():
+    assert "sizing" not in _FREEZE.STAGES and not hasattr(_FREEZE.Freezer, "sizing")
+    assert passrun.MAX_STORIES * 0.00851 <= 360  # the budget the retired stage enforced, at the baseline's 8.51 ms
+
+
+def test_cpu_acc_writes_the_reference_from_a_clean_tree_and_pins_it(freezer, monkeypatch, tmp_path):
+    import gzip
+    import hashlib
+    import tomllib
+
+    module, fz, runs, repo = freezer
+    store = tmp_path / "store"
+    monkeypatch.setenv("NEWS_SIGNAL_DATA", str(store))
+    seen = []
+
+    def fake_uv(*args):
+        seen.append(args)
+        ref = Path(args[args.index("--write-reference") + 1])
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(gzip.compress(b'{"a": 1}\n{"a": 2}\n'))
+        Path(args[args.index("--json-out") + 1]).write_text('{"horizons": {}}')
+
+    monkeypatch.setattr(module, "uv_run", fake_uv)
+    fz.cpu_acc()
+    gate = tomllib.loads((repo / ".vibesys" / "tasks" / "news-signal" / "gate.toml").read_text())["baseline"]
+    raw = (store / module.REFERENCE_FILE).read_bytes()
+    assert gate["reference_sha256"] == hashlib.sha256(raw).hexdigest() and gate["reference_pairs"] == 2
+    fz.cpu_acc()
+    assert len(seen) == 1  # the artifact and the reference are reused
+    (store / module.REFERENCE_FILE).unlink()
+    fz.cpu_acc()
+    assert len(seen) == 2  # a missing reference is regenerated
+    (repo / "serving" / "model.py").write_text("# edited\n")
+    (store / module.REFERENCE_FILE).unlink()
+    with pytest.raises(SystemExit, match="uncommitted"):
+        fz.cpu_acc()
+
+
+def test_reference_location_agrees_between_freeze_and_harness():
+    assert _FREEZE.REFERENCE_FILE == passrun.REFERENCE_FILE
 
 
 def test_freeze_refuses_null_ic_and_unclean_f1(freezer):
@@ -554,10 +685,9 @@ def _load_freeze():
 
 
 @settings(deadline=None)
-@given(ic=st.floats(-0.5, 0.5), se=st.floats(0, 0.1), a=st.floats(0.1, 1e4), b=st.floats(0.1, 1e4))
-def test_freeze_derivation(ic, se, a, b):
-    floor, noise = _FREEZE.derive(ic, se, a, b)
-    assert floor <= ic - 2 * se + 1e-12 and ic - 2 * se - floor < 1.1e-4
+@given(a=st.floats(0.1, 1e4), b=st.floats(0.1, 1e4))
+def test_freeze_derivation(a, b):
+    noise = _FREEZE.relative_noise(a, b)
     assert noise >= 0.03 and noise + 1e-9 >= abs(a - b) / ((a + b) / 2)
 
 
@@ -702,11 +832,189 @@ def test_missing_setpriv_refuses_a_real_data_pass(repo, store, monkeypatch):
 def test_checker_pass_and_fail_output_with_a_frozen_gate(capsys, monkeypatch):
     gate = {**_gate(), "h_minutes": 5}
     monkeypatch.setattr(checker, "load_gate", lambda: gate)
-    for score, code, text in ((_score(), 0, "PASS"), (_score(ic=0.0), 1, "FAIL: ic 0.0000 is below the floor")):
-        result = passrun.PassResult(None, None, None, score)
+    monkeypatch.setattr(checker, "load_reference", lambda g: {("s", "T"): 1.0})
+    for fid, code, text in ((FID, 0, "PASS"), (_fid(0.985), 1, "FAIL: direction agreement 0.9850 is below the floor")):
+        result = passrun.PassResult(None, None, None, _score())
         monkeypatch.setattr(checker, "run_pass", lambda *a, _r=result, **k: _r)
+        monkeypatch.setattr(checker, "score_fidelity", lambda r, ref, _f=fid: _f)
         assert checker.main([]) == code
         assert text in capsys.readouterr().out
+
+
+# -- the reference: file, digest, and the gate end to end on a fixture reference -----------------------
+
+N_REF = 200
+
+
+def _ref_rows():
+    """Reference pairs: directions cycle +, -, neutral; confidences are distinct, so the ranks are strict."""
+    return [(f"s{i}", "AAA", (1, -1, 0)[i % 3], (i + 1) / (N_REF + 1)) for i in range(N_REF)]
+
+
+def _fixture_pass(rows, *, flips=(), scrambled_confidence=False):
+    """A PassResult over the reference's pairs whose signals copy `rows`, but for `flips` (indexes whose direction
+    is reversed, or made positive when neutral) and, optionally, with the confidence ranking inverted."""
+    from datetime import UTC, datetime
+
+    from infosys.newsd import PassLog, ReceivedSignal
+    from infosys.replay import ReplayPlan
+    from infosys.store import Story
+
+    when = datetime(2024, 3, 11, 14, 0, tzinfo=UTC)
+    stories = tuple(Story(sid, "benzinga", when, (t,), "h", "b") for sid, t, _, _ in rows)
+    stamps = {st.story_id: 1.0 for st in stories}
+    plan = ReplayPlan((), stories, frozenset(), stamps, stamps, 1.0)
+    signals = []
+    for i, (sid, t, d, c) in enumerate(rows):
+        d = (-d or 1) if i in flips else d
+        signals.append(ReceivedSignal(sid, t, d, (1 - c) if scrambled_confidence else c, 1.5))
+    log = PassLog(0.0, signals, {}, 0, [1.0], 100.0)
+    return passrun.PassResult(plan, log, None, _score(pairs=len(rows), signaled=len(rows)))
+
+
+@pytest.fixture
+def reference(tmp_path, monkeypatch):
+    """A reference file in a scratch store, written by the real writer, and a frozen gate that pins its digest."""
+    import hashlib
+
+    rows = _ref_rows()
+    base = _fixture_pass(rows)
+    data = tmp_path / "refstore"
+    n = passrun.write_reference(data / passrun.REFERENCE_FILE, base.plan, base.log)
+    assert n == N_REF
+    digest = hashlib.sha256((data / passrun.REFERENCE_FILE).read_bytes()).hexdigest()
+    gate = _gate()
+    gate["baseline"]["reference_sha256"] = digest
+    gate["h_minutes"] = 5
+    monkeypatch.setenv("NEWS_SIGNAL_DATA", str(data))
+    monkeypatch.setattr(checker, "load_gate", lambda: gate)
+    monkeypatch.setattr(bench, "load_gate", lambda: gate)
+    return rows, gate, data
+
+
+def _run_checker(monkeypatch, capsys, result):
+    monkeypatch.setattr(checker, "run_pass", lambda *a, **k: result)
+    code = checker.main([])
+    return code, capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("flips", "constant", "code", "text"),
+    [((), False, 0, "PASS"),
+     ((5,), False, 0, "PASS"),  # 1 of 200 flipped: agreement 0.995
+     ((5, 6, 7), False, 1, "FAIL: direction agreement 0.9850 is below the floor"),
+     ((), True, 1, "FAIL: signal spearman")],
+)  # fmt: skip
+def test_accuracy_gate_against_a_fixture_reference(reference, monkeypatch, capsys, flips, constant, code, text):
+    rows, _, _ = reference
+    result = _fixture_pass(rows, flips=flips, scrambled_confidence=constant)
+    got, out = _run_checker(monkeypatch, capsys, result)
+    assert (got, text in out) == (code, True), out
+
+
+def test_a_perfect_copy_scores_one_and_a_scrambled_confidence_scores_below_the_floor(reference):
+    rows, gate, _ = reference
+    ref = passrun.load_reference(gate)
+    perfect = _fixture_pass(rows)
+    assert passrun.score_fidelity(perfect, ref).spearman == pytest.approx(1.0)
+    faked = _fixture_pass(rows, scrambled_confidence=True)
+    f = passrun.score_fidelity(faked, ref)
+    assert f.agreement == 1.0 and f.spearman < 0.95
+
+
+def test_a_missing_reference_fails_the_gate_closed_before_any_pass(reference, monkeypatch, capsys):
+    _, _, data = reference
+    (data / passrun.REFERENCE_FILE).unlink()
+    ran = []
+    monkeypatch.setattr(checker, "run_pass", lambda *a, **k: ran.append(1))
+    assert checker.main([]) == 1
+    assert "reference signals are missing" in capsys.readouterr().out and not ran
+
+
+def test_a_reference_with_another_digest_fails_closed_and_leaks_nothing(reference, monkeypatch, capsys):
+    rows, gate, data = reference
+    tampered = [(sid, t, -d, c) for sid, t, d, c in rows]
+    result = _fixture_pass(tampered)
+    passrun.write_reference(data / passrun.REFERENCE_FILE, result.plan, result.log)
+    ran = []
+    monkeypatch.setattr(checker, "run_pass", lambda *a, **k: ran.append(1))
+    assert checker.main([]) == 1
+    out = capsys.readouterr().out
+    assert "differ from the digest pinned" in out and not ran and str(data) not in out and "s0" not in out
+
+
+def test_a_reference_that_does_not_cover_the_pass_fails_closed(reference, monkeypatch, capsys):
+    rows, _, _ = reference
+    extra = _fixture_pass([*rows, ("s-extra", "AAA", 1, 0.5)])
+    got, out = _run_checker(monkeypatch, capsys, extra)
+    assert got == 1 and "do not cover every pair" in out
+
+
+def test_report_mode_without_a_reference_prints_na_and_still_runs(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("NEWS_SIGNAL_DATA", str(tmp_path))
+    gate = {**_gate(frozen=False), "h_minutes": 5}
+    gate["baseline"]["reference_sha256"] = ""
+    monkeypatch.setattr(checker, "load_gate", lambda: gate)
+    monkeypatch.setattr(checker, "run_pass", lambda *a, **k: passrun.PassResult(None, None, None, _score()))
+    assert checker.main(["--report"]) == 0
+    assert "fidelity: n/a" in capsys.readouterr().out
+
+
+def test_write_reference_refuses_an_incomplete_pass_and_writes_nothing(tmp_path):
+    rows = _ref_rows()
+    result = _fixture_pass(rows)
+    result.log.signals.pop()
+    with pytest.raises(PassError, match="1 pairs without a signal"):
+        passrun.write_reference(tmp_path / "r" / "x.jsonl.gz", result.plan, result.log)
+    assert not (tmp_path / "r").exists()
+
+
+def test_write_reference_is_deterministic_and_round_trips(tmp_path):
+    import hashlib
+
+    rows = _ref_rows()
+    result = _fixture_pass(rows)
+    paths = [tmp_path / f"{i}.jsonl.gz" for i in (1, 2)]
+    for path in paths:
+        passrun.write_reference(path, result.plan, result.log)
+    assert paths[0].read_bytes() == paths[1].read_bytes()
+    gate = _gate()
+    gate["baseline"]["reference_sha256"] = hashlib.sha256(paths[0].read_bytes()).hexdigest()
+    (tmp_path / "reference").mkdir()
+    (tmp_path / "reference" / "validation.jsonl.gz").write_bytes(paths[0].read_bytes())
+    ref = passrun.load_reference(gate, tmp_path)
+    assert ref == {(sid, t): d * c for sid, t, d, c in rows}
+
+
+def test_checker_refuses_write_reference_outside_report_mode(capsys):
+    assert checker.main(["--write-reference", "x"]) == 1
+    assert "--write-reference needs --report" in capsys.readouterr().out
+
+
+def test_benchmark_fails_closed_without_the_reference_once_frozen(reference, monkeypatch, tmp_path):
+    _, _, data = reference
+    (data / passrun.REFERENCE_FILE).unlink()
+    monkeypatch.setattr(bench, "run_pass", lambda *a, **k: pytest.fail("the pass must not start"))
+    out = tmp_path / "o.jsonl"
+    assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 1
+    err = _check_stream(out.read_text().splitlines())
+    assert "reference signals are missing" in err["message"]
+
+
+@pytest.mark.parametrize(("flips", "kind"), [((), "result"), ((3,), "result"), ((3, 4, 5), "error")])
+def test_benchmark_bursts_check_against_a_fixture_reference(reference, monkeypatch, tmp_path, flips, kind):
+    rows, _, _ = reference
+    result = _fixture_pass(rows, flips=flips)
+    result.score = _score(pairs=N_REF, signaled=N_REF)
+    monkeypatch.setattr(bench, "run_pass", lambda *a, **k: result)
+    out = tmp_path / "o.jsonl"
+    bench.main(["--mode", "bursts", "--vs-output", str(out)])
+    rec = _check_stream(out.read_text().splitlines())
+    assert rec["kind"] == kind
+    if kind == "result":
+        assert rec["values"]["direction_agreement"] == (N_REF - len(flips)) / N_REF
+    else:
+        assert "direction agreement" in rec["message"]
 
 
 def test_unshare_failure_refuses_a_real_data_pass_without_fallback(repo, store, monkeypatch):
@@ -761,17 +1069,17 @@ def test_invalid_pass_is_rerun_once_and_the_rerun_is_used(tmp_path):
     log, score, first = passrun.run_with_retry(attempt, scores.__getitem__)
     assert (log, len(calls), score.valid, first.invalid_reason) == ("b", 2, True, LAG)
     gate = _gate()
-    rec = _check_stream(_write(tmp_path, bench.records_for(score, gate, DIRS, first)))
+    rec = _check_stream(_write(tmp_path, bench.records_for(score, gate, DIRS, first, fid=FID)))
     assert rec["kind"] == "result" and rec["values"]["reruns"] == 1
     assert rec["values"]["first_pass_send_lag_p90_ms"] == 9.0
-    assert checker.evaluate_gate(score, gate) is None
+    assert checker.evaluate_gate(score, gate, FID) is None
 
 
 def test_valid_pass_is_not_rerun(tmp_path):
     attempt, calls = _attempts("a")
     _, score, first = passrun.run_with_retry(attempt, lambda _: _score())
     assert len(calls) == 1 and first is None
-    rec = _check_stream(_write(tmp_path, bench.records_for(score, _gate(), DIRS, first)))
+    rec = _check_stream(_write(tmp_path, bench.records_for(score, _gate(), DIRS, first, fid=FID)))
     assert rec["values"]["reruns"] == 0
 
 
@@ -781,10 +1089,10 @@ def test_two_invalid_passes_fail_and_name_both_reasons(tmp_path):
     bad = {"a": _score(valid=False, invalid_reason=LAG), "b": _score(valid=False, invalid_reason=second)}
     _, score, first = passrun.run_with_retry(attempt, bad.__getitem__)
     assert len(calls) == 2 and not score.valid
-    err = _check_stream(_write(tmp_path, bench.records_for(score, _gate(), DIRS, first)))
+    err = _check_stream(_write(tmp_path, bench.records_for(score, _gate(), DIRS, first, fid=FID)))
     assert err["kind"] == "error" and "after a rerun" in err["message"]
     assert "7.0" in err["message"] and "9.0" in err["message"]
-    assert "invalid pass" in checker.evaluate_gate(score, _gate())
+    assert "invalid pass" in checker.evaluate_gate(score, _gate(), FID)
 
 
 def test_bursts_mode_uses_the_named_gap_cap():
@@ -806,7 +1114,7 @@ def test_task_timeouts_cover_two_passes_and_prepare():
     assert cfg["benchmark"]["timeout_seconds"] >= worst_bench
 
 
-def test_cpu_acc_artifact_survives_h_and_sizing_but_not_code_changes(freezer):
+def test_cpu_acc_artifact_survives_h_and_a_gate_edit_but_not_code_changes(freezer):
     module, fz, runs, repo = freezer
     art = runs / "cpu-acc.json"
     art.write_text("{}")
@@ -834,7 +1142,7 @@ def test_baseline_artifacts_are_stale_after_a_serving_or_task_file_edit(freezer)
 
 
 def test_send_lag_fields_are_in_the_benchmark_record(tmp_path):
-    rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS)))
+    rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, fid=FID)))
     assert [rec["values"][f"newsd_send_lag_{k}_ms"] for k in ("p50", "p90", "p99", "max")] == [0.2, 0.3, 0.4, 0.9]
 
 
@@ -881,7 +1189,7 @@ FEEDS_STATS = {"benzinga": {"pairs": 900, "p50": 6.0, "p99": 25.0, "first": 60},
 
 def test_benchmark_record_carries_the_record_only_scalars(tmp_path):
     serve = passrun.ServeProbe(cold_start_s=12.5, gpu_mem_idle_mib=300.0, gpu_mem_peak_mib=4096.0)
-    rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, None, serve)))
+    rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, None, serve, fid=FID)))
     v = rec["values"]
     assert (v["p90_latency_ms"], v["max_latency_ms"], v["throughput_signals_per_s"]) == (9.0, 30.0, 50.0)
     assert (v["cold_start_s"], v["gpu_mem_peak_mib"]) == (12.5, 4096.0)
@@ -889,16 +1197,16 @@ def test_benchmark_record_carries_the_record_only_scalars(tmp_path):
 
 def test_unreadable_gpu_memory_and_unknown_cold_start_are_absent_not_failures(tmp_path):
     for serve in (None, passrun.ServeProbe()):
-        rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, None, serve)))
+        rec = _check_stream(_write(tmp_path, bench.records_for(_score(), _gate(), DIRS, None, serve, fid=FID)))
         assert rec["kind"] == "result" and "gpu_mem_peak_mib" not in rec["values"] and "cold_start_s" not in rec["values"]
 
 
 def test_record_only_numbers_change_no_decision():
     base, odd = _score(), _score(feed_latency_ms=FEEDS_STATS)
     gate = _gate()
-    assert checker.evaluate_gate(base, gate) == checker.evaluate_gate(odd, gate) is None
+    assert checker.evaluate_gate(base, gate, FID) == checker.evaluate_gate(odd, gate, FID) is None
     serve = passrun.ServeProbe(cold_start_s=1e6, gpu_mem_peak_mib=1e9)
-    kinds = {bench.records_for(base, gate, DIRS, None, s)[-1]["kind"] for s in (None, serve)}
+    kinds = {bench.records_for(base, gate, DIRS, None, s, fid=FID)[-1]["kind"] for s in (None, serve)}
     assert kinds == {"result"}
 
 
@@ -909,7 +1217,7 @@ def test_benchmark_main_writes_a_sidecar_with_the_per_feed_stats(tmp_path, monke
     result = SimpleNamespace(score=_score(feed_latency_ms=FEEDS_STATS), log=SimpleNamespace(signals=[]), first_invalid=None, serve=serve)
     result.log.signals = [SimpleNamespace(direction=d) for d in (-1, 1)]
     monkeypatch.setattr(bench, "run_pass", lambda *a, **k: result)
-    monkeypatch.setattr(bench, "load_gate", _gate)
+    monkeypatch.setattr(bench, "load_gate", lambda: _gate(frozen=False))
     out = tmp_path / "o.jsonl"
     assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 0
     _check_stream(out.read_text().splitlines())
@@ -924,7 +1232,7 @@ def test_unwritable_sidecar_does_not_fail_a_written_result(tmp_path, monkeypatch
     result = SimpleNamespace(score=_score(), log=SimpleNamespace(signals=[SimpleNamespace(direction=d) for d in (-1, 1)]),
                              first_invalid=None, serve=passrun.ServeProbe())
     monkeypatch.setattr(bench, "run_pass", lambda *a, **k: result)
-    monkeypatch.setattr(bench, "load_gate", _gate)
+    monkeypatch.setattr(bench, "load_gate", lambda: _gate(frozen=False))
     out = tmp_path / "o.jsonl"
     (tmp_path / "o.jsonl.stats.json").mkdir()  # a directory where the sidecar goes
     assert bench.main(["--mode", "bursts", "--vs-output", str(out)]) == 0
@@ -933,7 +1241,7 @@ def test_unwritable_sidecar_does_not_fail_a_written_result(tmp_path, monkeypatch
 
 def test_failed_benchmark_writes_no_sidecar(tmp_path, monkeypatch):
     monkeypatch.setattr(bench, "run_pass", lambda *a, **k: (_ for _ in ()).throw(PassError("x")))
-    monkeypatch.setattr(bench, "load_gate", _gate)
+    monkeypatch.setattr(bench, "load_gate", lambda: _gate(frozen=False))
     assert bench.main(["--mode", "bursts", "--vs-output", str(tmp_path / "o.jsonl")]) == 1
     assert not (tmp_path / "o.jsonl.stats.json").exists()
 

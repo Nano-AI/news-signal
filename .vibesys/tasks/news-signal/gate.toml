@@ -1,20 +1,25 @@
 # PLACEHOLDER VALUES. The baseline is pending: `frozen = false` makes the accuracy gate fail until
 # scripts/freeze_baseline.py measures the unmodified serving/ on real data and rewrites this file.
-infosys_sha256 = "0c18f862c1c88164ad5c9deae5656ff2f181cc4b785484b2d5d7a246c900e24d"
+infosys_sha256 = "db0499e8921ba2139a885a5b0588ce3506ad91bf1c085ea5b87f6426795ebd09"
 repo_sha256 = "73aabd26acf46e7a4dddfce6ca12b96148e74ef6518eb7a5a019e4efabcddf13"
 h_minutes = 5
-h_reason = "PENDING: chosen by the noise rule in scripts/freeze_baseline.py"
+h_reason = "PENDING: fixed at 5 min by scripts/freeze_baseline.py (IC is record only)"
 max_missed_frac = 0.001
 max_duplicate_frac = 0.001
 max_invalid = 0
+agreement_floor = 0.99  # fraction of hidden reference pairs whose signal direction the candidate reproduces
+spearman_floor = 0.95  # Spearman of candidate vs reference signal over the pairs the candidate signalled
 
 [baseline]
 frozen = false
-ic = 0.0
+ic = 0.0  # IC fields are record only: nothing decides on them
 ic_se = 0.0
-ic_floor = 0.0
 bursts_ic = 0.0  # PLACEHOLDER: mean IC of the two baseline bursts runs
 validation_stories = 0
 scored_pairs = 0
 p99_ms = [0.0, 0.0]
-ms_per_headline = 0.0
+reference_sha256 = ""  # PLACEHOLDER: sha256 of <store>/reference/validation.jsonl.gz, pinned by the cpu-acc stage
+reference_pairs = 0
+f1_agreement = 0.0  # PLACEHOLDER: GPU baseline accuracy pass vs the CPU reference
+f1_spearman = 0.0
+bursts_agreement = [0.0, 0.0]  # PLACEHOLDER: agreement of the two baseline bursts passes
