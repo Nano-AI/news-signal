@@ -68,19 +68,40 @@ Systematic server lateness, which is what a CPU-starving candidate causes, moves
 move the tail (an idle GPU node showed intermittent 15-20 ms stalls; measured passes kept p90 around 1.5 ms). A stall bunches late
 stories, which makes the candidate's job harder, not easier, and latency is measured from the enqueue instant, so
 stalls never flatter the candidate.
-The pass also scores prediction quality: it fails if the service emits fewer than two distinct directions, or if
-its IC is below the baseline bursts IC minus 3 standard errors of the pass. The service process runs at nice 10
+The pass also scores prediction quality against the hidden reference (see "Quality" below): it fails if the
+service emits fewer than two distinct directions, if its direction agreement is under 0.99, or if its signal
+Spearman is under 0.95. The result also reports `direction_agreement` and `signal_spearman`; `ic` and `ic_se` are
+recorded for information only. The service process runs at nice 10
 so its CPU threads cannot starve `newsd`'s scheduler.
 
 **Accuracy gate** (`accuracy_checker/checker.py`): replays a fixed sample of up to 30,000 validation stories at
-a high rate and scores prediction quality as the rank correlation (IC) between `direction * confidence` and
-the 5-minute forward return. It passes only when the pass is valid, IC is at least the frozen `ic_floor` in
-`gate.toml` (baseline IC minus two bootstrap standard errors), and missed, duplicate and invalid counts are
-within the gate. The pass ends once every pair has a signal and 5 s pass with none (at most 10 minutes after
+a high rate and scores prediction quality as fidelity to the original FinBERT (see "Quality" below). It passes only
+when the pass is valid, direction agreement is at least 0.99 and signal Spearman at least 0.95 (`agreement_floor`
+and `spearman_floor` in `gate.toml`), and missed, duplicate and invalid counts are within the gate. It also
+prints the IC of the 5-minute forward return, which decides nothing. The pass ends once every pair has a signal and 5 s pass with none (at most 10 minutes after
 the last story), so a keeping-up service finishes in about the replay time (up to 5 minutes) plus startup.
 
 The score is computed by `infosys/`; the held-out holdout split exists only for the final report and is never
 used in a round to tune a knob or choose between candidates.
+
+## Quality
+
+Quality means **agreeing with the original FinBERT**. The reference is the signal the unmodified `ProsusAI/finbert`
+produces for every `(story, ticker)` pair of the validation split, in fp32 on CPU; it is hidden from you in both
+prepare and serve, like the rest of the scoring data. A pass must reproduce it:
+
+- **Direction agreement >= 0.99**: the fraction of reference pairs where your signal's direction equals the
+  reference's. The direction of a signal is the sign of `direction * confidence`: -1, +1, or 0 for a neutral
+  signal (`direction = 0`, or `confidence = 0`). Neutral agrees only with neutral. A pair you do not signal counts as
+  a disagreement.
+- **Signal Spearman >= 0.95**: the rank correlation of your `direction * confidence` with the reference's over the
+  pairs you signalled. This guards against keeping the directions but faking the confidence (for example a constant
+  confidence). A faithful fp16 or int8 model scores above 0.99.
+
+Precision changes, fused kernels, batching, compilation and distillation are all
+allowed if the signals still match. The IC (rank correlation with the forward return) is still computed and
+reported, for information only: on this data the baseline's IC is indistinguishable from zero, so it cannot say
+whether a faster model is as good.
 
 ## Fast CPU check before submitting
 
@@ -100,7 +121,8 @@ accuracy gate on real data stays the gate. Keep `--device cpu` working in `servi
 
 ## Baseline
 
-Pending: the baseline has not been frozen. The numbers (IC, IC floor, p99 latency of the unmodified
-`serving/` on two runs, validation story count, scored pairs, and a record-only block with p90 and max latency,
+Pending: the baseline has not been frozen. The numbers (the reference pair count and digest, the baseline's own
+agreement and Spearman on the GPU accuracy pass and on both bursts passes, IC (record only), p99 latency of the
+unmodified `serving/` on two runs, validation story count, scored pairs, and a record-only block with p90 and max latency,
 throughput, send lag, model load time, peak GPU memory and per-feed latency) are written here and into `gate.toml` by
 `scripts/freeze_baseline.py`.

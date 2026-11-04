@@ -14,8 +14,7 @@ An optimizer can cheat a latency benchmark in many ways: skip the model, emit co
 stories, memoize the scoring data, or starve the clock that measures it. The design closes those routes:
 
 - **A real baseline.** The starting service is a plain Hugging Face FinBERT classifier, one headline per call.
-  Its accuracy sets a floor. A faster service must keep the baseline's information coefficient (IC, the rank
-  correlation between `direction * confidence` and the forward return) within a margin.
+  A faster service must reproduce its signals (see "Quality rule").
 - **Two codebases that share one document.** `infosys/` (evaluator-owned) and `serving/` (the candidate) share
   only `docs/protocol.md`. `tests/test_boundaries.py` checks that neither imports the other.
 - **Pinned evaluator.** Digests of `infosys/` and of `pyproject.toml`, `uv.lock` and `docs/protocol.md` are pinned
@@ -25,8 +24,8 @@ stories, memoize the scoring data, or starve the clock that measures it. The des
   wrapper").
 - **A fair clock.** Latency starts when `newsd` hands the story over, and a pass is thrown out if `newsd` itself
   falls behind.
-- **No degenerate wins.** The pass fails if the signals use fewer than two directions, or if their IC drops below
-  the baseline.
+- **No degenerate wins.** The pass fails if the signals use fewer than two directions, or if they stop matching the
+  baseline FinBERT's.
 
 The full candidate rules are in [`.vibesys/tasks/news-signal/OBJECTIVE.md`](.vibesys/tasks/news-signal/OBJECTIVE.md).
 
@@ -83,9 +82,24 @@ pass is an error, not a result. The service process runs at nice 10, so its thre
 **Early finish.** After the last story is released, `newsd` ends the pass once every measured pair has a signal
 and 5 s pass with no new accepted signal. The drain still has a hard cap.
 
-**Quality checks.** The accuracy gate needs IC at or above a frozen floor (baseline IC minus two bootstrap
-standard errors). The bursts pass fails if the IC is below the baseline bursts IC minus three standard errors,
-or if the signals use only one direction.
+**Quality checks.** The accuracy gate and the bursts pass both need direction agreement >= 0.99 and signal
+Spearman >= 0.95 against the hidden reference, and the bursts pass also fails if the signals use only one
+direction. See "Quality rule".
+
+### Quality rule
+
+Quality is fidelity to the original FinBERT, in the style of MLPerf's reference accuracy: the reference is the
+unmodified model's signal for every validation `(story, ticker)` pair, computed once by the freeze on CPU in fp32
+and stored in the scoring data (`reference/validation.jsonl.gz`), so the hiding wrapper hides it from the
+candidate. Its sha256 is pinned in `gate.toml`, and a missing or different file fails the gate closed. A candidate
+must agree with the reference direction (sign of `direction * confidence`; neutral agrees only with neutral; a
+missed pair is a disagreement) on at least 99% of pairs, with a signal Spearman of at least 0.95. The reference is
+derived from private data and is never committed.
+
+Why not an IC floor: on the real validation split the baseline's IC is indistinguishable from zero at every
+horizon (5, 15, 30, 60 min: +0.007, -0.013, -0.008, -0.009 with a standard error of about 0.012). The headlines
+coincide with price moves rather than lead them, so a floor of baseline minus two standard errors would be about
+-0.02 and random signals would pass it. IC is still computed and reported, for information only.
 
 ## The hiding wrapper
 
@@ -206,13 +220,12 @@ The script is idempotent and uses only the standard library. Its stages, in orde
 | `manifest` | Copies the store's manifest into the task as the pin. |
 | `pin` | Writes the digests of `infosys/` and of `pyproject.toml`, `uv.lock`, `docs/protocol.md` into `gate.toml`. |
 | `budget` | Checks the bursts replay has at least 300 stories, or raises the window budget. |
-| `cpu-acc` | Dry-runs the accuracy checker on CPU at every horizon (5, 15, 30, 60 minutes). This stage is slow (CPU FinBERT over the whole sample) and prints no progress. |
-| `h` | Picks the horizon H: the first whose IC is more than two standard errors above zero. |
-| `sizing` | Caps the accuracy sample so its replay fits the time budget. |
+| `cpu-acc` | Runs the baseline on CPU in fp32 over every validation story, from a clean tree. Writes the reference signals into the store, pins their sha256 in `gate.toml`, and records IC at every horizon (5, 15, 30, 60 minutes). This stage is slow and prints no progress. |
+| `h` | Fixes H = 5 and prints the IC-by-horizon table. IC is record only, so this stage never stops the freeze. |
 | `sync` | Refuses a dirty `serving/` or `infosys/`, then copies the checkout and store to the cluster. |
 | `probe` | Not in the default run. A GPU job that checks the hiding wrapper. Run it with `--stages probe`. |
-| `f1` | GPU job: the accuracy checker on the baseline, in report mode. |
-| `f2` | GPU job: the bursts benchmark, twice. |
+| `f1` | GPU job: the accuracy checker on the baseline, in report mode. The freeze stops if the GPU baseline's agreement is under 0.99 or its Spearman under 0.95 against the CPU reference. |
+| `f2` | GPU job: the bursts benchmark, twice. Each pass's agreement is recorded. |
 | `freeze` | Writes `gate.toml`, `objectives.toml` and the baseline section of `OBJECTIVE.md`. |
 
 A stage's output is reused only if the commit, digests, H and `passrun.py` are unchanged. `--force STAGE`
@@ -225,9 +238,9 @@ cluster address and paths from its own output. Details are in the docstring of
 
 The baseline is pending. No real data has been pulled yet, so `gate.toml` holds placeholder values and
 `frozen = false`. Running `scripts/freeze_baseline.py` after the data pull fills `gate.toml` and the baseline
-section of `.vibesys/tasks/news-signal/OBJECTIVE.md` with: IC and its standard error, the IC floor, the horizon H
-and why it was chosen, validation stories and scored pairs, the baseline p99 latency on two runs, the relative
-noise, and milliseconds per headline. This section will then list them.
+section of `.vibesys/tasks/news-signal/OBJECTIVE.md` with: the reference pair count and digest, the baseline's own
+agreement and Spearman, IC and its standard error (record only), the horizon H, validation stories and scored
+pairs, the baseline p99 latency on two runs, and the relative noise. This section will then list them.
 
 ## Publishing
 
