@@ -20,6 +20,8 @@ stories, memoize the scoring data, or starve the clock that measures it. The des
 - **Pinned evaluator.** Digests of `infosys/` and of `pyproject.toml`, `uv.lock` and `docs/protocol.md` are pinned
   in `.vibesys/tasks/news-signal/gate.toml`. A pass is refused, before it runs, if any of them differs. The
   harness runs `uv run`; the pinned `pyproject.toml` and `uv.lock` keep the dependencies fixed.
+- **No candidate imports in the gate.** The gate never imports from the candidate tree except the digest-verified
+  `infosys/`, which is loaded by path (the repo root is never on `sys.path`) and re-verified at the end of the pass.
 - **Hidden scoring data.** On real data, the candidate runs where the data cannot be seen (see "The hiding
   wrapper").
 - **A fair clock.** Latency starts when `newsd` hands the story over, and a pass is thrown out if `newsd` itself

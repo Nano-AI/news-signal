@@ -4,6 +4,7 @@ import json
 import math
 import dataclasses
 import os
+import py_compile
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,52 @@ def test_large_file_rejected_but_fixtures_and_vibesys_are_not(tmp_path):
     with pytest.raises(PassError) as e:
         passrun.check_candidate_files(tmp_path)
     assert e.value.requirement == "no_weights_in_git" and "blob.dat" in e.value.message
+
+
+_SHADOWS = ("scipy", "aiohttp", "pydantic", "numpy")
+_GATE_IMPORTS = """
+import sys
+from pathlib import Path
+sys.path.insert(0, {task!r})
+import passrun
+root = Path({root!r})
+passrun._trust_infosys(root, passrun.load_gate())
+from infosys.newsd import serve_pass
+from infosys.replay import plan_pass
+from infosys.score import score_pass
+from infosys.store import load_split
+from infosys.protocol import TrainRecord
+"""
+
+
+def test_candidate_root_never_shadows_the_gates_imports(repo, tmp_path):
+    marker = tmp_path / "shadow-ran"
+    for name in _SHADOWS:  # a top-level package in the candidate tree, which passes both digest pins
+        (repo / name).mkdir()
+        (repo / name / "__init__.py").write_text(f"open({str(marker)!r}, 'a').write({name!r})\n")
+    pyc = repo / "infosys" / "__pycache__"  # an unchecked-hash .pyc is run without comparing it to the source
+    pyc.mkdir(exist_ok=True)
+    evil = tmp_path / "evil.py"
+    evil.write_text(f"open({str(marker)!r}, 'a').write('pyc')\n")
+    py_compile.compile(str(evil), cfile=str(pyc / f"protocol.{sys.implementation.cache_tag}.pyc"),
+                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+    code = _GATE_IMPORTS.format(task=str(passrun.TASK), root=str(repo))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=BOUND_S, cwd=tmp_path)
+    assert not marker.exists(), marker.read_text()
+    assert r.returncode == 0, r.stderr
+
+
+def test_infosys_tampered_during_the_pass_is_caught_at_the_end(repo, smoke, monkeypatch):
+    def tamper_then_finish(attempt, score):
+        with (repo / "infosys" / "score.py").open("ab") as f:
+            f.write(b"\n")  # what an unconfined serving.prepare could have done after the first check
+        return smoke.log, smoke.score, None
+
+    monkeypatch.setattr(passrun, "_run_prepare", lambda *a, **k: None)
+    monkeypatch.setattr(passrun, "run_with_retry", tamper_then_finish)
+    with pytest.raises(PassError) as e:
+        passrun.run_pass(Mode.SMOKE, "validation", root=repo, device="cpu")
+    assert e.value.requirement == "infosys_unchanged"
 
 
 def test_infosys_edit_rejected(repo):

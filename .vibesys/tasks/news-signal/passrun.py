@@ -14,6 +14,8 @@ import gc
 import glob
 import gzip
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -220,7 +222,10 @@ def check_candidate_files(root: Path) -> None:
         )
 
 
-def _trust_infosys(root: Path, gate: dict) -> None:
+_INFOSYS_MODULES = ("protocol", "store", "replay", "newsd", "score")  # everything the gate imports from infosys
+
+
+def _verify_pins(root: Path, gate: dict) -> None:
     if infosys_digest(root) != gate["infosys_sha256"]:
         raise PassError("infosys/ differs from the digest pinned in gate.toml", requirement="infosys_unchanged")
     if repo_digest(root) != gate["repo_sha256"]:
@@ -228,8 +233,30 @@ def _trust_infosys(root: Path, gate: dict) -> None:
             "pyproject.toml, uv.lock or docs/protocol.md differ from the digest pinned in gate.toml",
             requirement="infosys_unchanged",
         )
-    if "infosys" not in sys.modules and str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+
+
+def _trust_infosys(root: Path, gate: dict) -> None:
+    """Verify the pins, then load `root/infosys` and everything it needs before any candidate code runs.
+
+    The candidate root is never put on sys.path: a top-level `scipy/` or `aiohttp/` there would otherwise shadow
+    the real package inside this process. Third-party packages and every infosys module the gate uses are
+    imported here, so later lazy imports only hit sys.modules."""
+    _verify_pins(root, gate)
+    for name in ("numpy", "scipy.stats", "pydantic", "aiohttp.web"):
+        importlib.import_module(name)
+    if "infosys" not in sys.modules:
+        # infosys/__pycache__ is not in the digest and an unchecked-hash .pyc is trusted without comparing the
+        # source, so bytecode is never read from (or written to) the candidate tree.
+        sys.pycache_prefix = tempfile.mkdtemp(prefix="ns-pyc-")
+        init = root / "infosys" / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "infosys", init, submodule_search_locations=[str(init.parent)]
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["infosys"] = module
+        spec.loader.exec_module(module)
+    for name in _INFOSYS_MODULES:
+        importlib.import_module(f"infosys.{name}")
 
 
 # -- the hidden reference signals ------------------------------------------------------------------------
@@ -723,6 +750,7 @@ def run_pass(
             )
         finally:
             gc.unfreeze()
+    _verify_pins(root, gate)  # serving.prepare is not write-confined: nothing may have changed since the first check
     return PassResult(plan, log, bars, score, first, probes[-1])
 
 
