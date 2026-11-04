@@ -55,7 +55,12 @@ Two commands, both run from the repo root on the MI210 node.
 split, up to 180 s of compressed replay (gaps capped at 2 s), on six feeds with different delays, drops and
 duplicates. Latency of a pair is the time from `newsd` handing the story to the service to the first accepted
 signal for the pair. Reported: `p99_latency_ms` and `p50_latency_ms` (the objectives), `p90_latency_ms`,
-`throughput_signals_per_s`, `missed`, `duplicates`, `invalid` and `newsd_send_lag_p50_ms`, `_p90_ms`, `_p99_ms` and `_max_ms`. A pass with any
+`throughput_signals_per_s`, `missed`, `duplicates`, `invalid`, `newsd_send_lag_p50_ms`, `_p90_ms`, `_p99_ms` and `_max_ms`. Also recorded, and decisive for
+nothing: `max_latency_ms`; `cold_start_s` (spawn of the service to its `POST /ready`, as the harness sees it);
+`gpu_mem_peak_mib` (peak whole-device VRAM while the service runs, sampled by the harness from outside the
+namespace every 250 ms, absent when the host exposes none); and, in `<vs-output>.stats.json`, per-feed p50 and p99
+of `receipt - that feed's send` with how often each feed sent a story first. Throughput is measured pairs with a
+signal divided by the time from the first measured send to the last first-signal receipt. A pass with any
 missed pair beyond 0.1 %, duplicate beyond 0.1 %, or any invalid signal produces an error, not a result. So does
 a pass in which `newsd` itself fell behind (send lag p90 over 5 ms or p99 over 50 ms) twice: the harness reruns an invalid pass once
 and uses the rerun, reporting `reruns` and the first pass's send lag.
@@ -96,5 +101,6 @@ accuracy gate on real data stays the gate. Keep `--device cpu` working in `servi
 ## Baseline
 
 Pending: the baseline has not been frozen. The numbers (IC, IC floor, p99 latency of the unmodified
-`serving/` on two runs, validation story count, scored pairs) are written here and into `gate.toml` by
+`serving/` on two runs, validation story count, scored pairs, and a record-only block with p90 and max latency,
+throughput, send lag, model load time, peak GPU memory and per-feed latency) are written here and into `gate.toml` by
 `scripts/freeze_baseline.py`.
