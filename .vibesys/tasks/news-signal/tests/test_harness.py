@@ -93,7 +93,7 @@ def test_gate_toml_complete():
     if base["frozen"]:
         assert len(base["reference_sha256"]) == 64 and base["reference_pairs"] > 0
         assert base["f1_agreement"] >= gate["agreement_floor"] and base["f1_spearman"] >= gate["spearman_floor"]
-        assert min(base["bursts_agreement"]) > 0 and base["validation_stories"] > 0 and base["scored_pairs"] > 0
+        assert min(base["bursts_agreement"]) > 0 and min(base["bursts_spearman"]) > 0 and base["validation_stories"] > 0 and base["scored_pairs"] > 0
 
 
 def test_digest_ignores_caches_and_sees_edits(tmp_path):
@@ -479,7 +479,7 @@ REF_SHA = "ab" * 32
 
 
 def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0, sidecars=True, agreement=0.9995,
-               spearman=0.9991, bursts_agreement=0.998, pinned=True):
+               spearman=0.9991, bursts_agreement=0.998, bursts_spearman=0.99, pinned=True):
     if pinned:  # what the cpu-acc stage does once it has written the reference
         gate = runs.parent / "repo" / ".vibesys" / "tasks" / "news-signal" / "gate.toml"
         _FREEZE.set_toml(gate, "reference_sha256", f'"{REF_SHA}"', section="baseline")
@@ -490,13 +490,14 @@ def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0,
              "send_lag_ms": {"p50": 0.2, "p90": 0.3, "p99": 0.4, "max": 0.9},
              "feed_latency_ms": FEEDS_STATS if sidecars else {}}  # fmt: skip
     serve = {"cold_start_s": 12.5, "gpu_mem_idle_mib": 300.0, "gpu_mem_peak_mib": 4096.0} if sidecars else {}
-    fidelity = {"pairs": 1000, "agreed": 1000, "agreement": agreement, "both": 1000, "non_neutral": 600, "spearman": spearman}
+    fidelity = {"pairs": 1000, "agreed": 1000, "agreement": agreement, "both": 1000, "non_neutral": 600, "spearman": spearman,
+                "confidence_spearman": 0.88}
     (runs / "f1.json").write_text(json.dumps({"score": score, "serve": serve, "fidelity": fidelity}))
     (runs / "cpu-acc.json").write_text(json.dumps({"horizons": {}}))
     fz.stamp(runs / "f1.json")
     for i, p99 in enumerate((100.0, 104.0), start=1):
         values = {"p99_latency_ms": p99, "p50_latency_ms": 10.0, "stories": 300, "ic": bursts_ic,
-                  "direction_agreement": bursts_agreement, "signal_spearman": 0.99,
+                  "direction_agreement": bursts_agreement, "signal_spearman": bursts_spearman,
                   "newsd_send_lag_p50_ms": 0.7, "newsd_send_lag_p90_ms": lag_p90, "newsd_send_lag_p99_ms": 20.0,
                   "newsd_send_lag_max_ms": 25.0, "p90_latency_ms": 50.0, "max_latency_ms": 30.0,
                   "throughput_signals_per_s": 50.0}  # fmt: skip
@@ -504,7 +505,8 @@ def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0,
         (runs / f"bench-{i}.jsonl").write_text(json.dumps(bench.HELLO) + "\n" + json.dumps(rec) + "\n")
         fz.stamp(runs / f"bench-{i}.jsonl")
         if sidecars:
-            (runs / f"bench-{i}.jsonl.stats.json").write_text(json.dumps({"feeds": FEEDS_STATS, "serve": serve}))
+            (runs / f"bench-{i}.jsonl.stats.json").write_text(
+                json.dumps({"feeds": FEEDS_STATS, "serve": serve, "fidelity": {"confidence_spearman": 0.88}}))
 
 
 def test_freeze_rewrites_task_files_idempotently(freezer):
@@ -542,14 +544,37 @@ def test_freeze_stops_when_the_gpu_baseline_does_not_reproduce_the_reference(fre
     fz.freeze()
 
 
-def test_freeze_needs_the_pinned_reference_and_records_a_low_bursts_agreement(freezer, capsys):
+def test_freeze_needs_the_pinned_reference(freezer):
     _, fz, runs, _ = freezer
     _artifacts(fz, runs, pinned=False)
     with pytest.raises(SystemExit, match="no pinned reference digest"):
         fz.freeze()
-    _artifacts(fz, runs, bursts_agreement=0.97)
-    fz.freeze()  # recorded and warned about, not a stop
-    assert "WARNING bench-1.jsonl: bursts agreement 0.9700" in capsys.readouterr().out
+    _artifacts(fz, runs)
+    fz.freeze()
+
+
+def test_freeze_stops_when_the_baseline_fails_its_own_bursts_gate(freezer):
+    _, fz, runs, _ = freezer
+    for kw in ({"bursts_agreement": 0.985}, {"bursts_spearman": 0.9}):
+        _artifacts(fz, runs, **kw)
+        with pytest.raises(SystemExit, match="fails its own bursts gate"):
+            fz.freeze()
+    _artifacts(fz, runs, bursts_agreement=0.99, bursts_spearman=0.95)  # inclusive
+    fz.freeze()
+
+
+def test_freeze_records_both_bursts_values_and_the_confidence_spearman(freezer):
+    import tomllib
+
+    _, fz, runs, repo = freezer
+    _artifacts(fz, runs, bursts_agreement=0.996, bursts_spearman=0.97)
+    fz.freeze()
+    task = repo / ".vibesys" / "tasks" / "news-signal"
+    base = tomllib.loads((task / "gate.toml").read_text())["baseline"]
+    assert base["bursts_agreement"] == [0.996, 0.996] and base["bursts_spearman"] == [0.97, 0.97]
+    md = (task / "OBJECTIVE.md").read_text()
+    assert "Spearman 0.9700 and 0.9700" in md and "within-sign confidence Spearman 0.8800" in md
+    assert "confidence_spearman" not in (task / "gate.toml").read_text()  # record only
 
 
 def test_h_stage_fixes_h_and_never_stops_on_a_noise_level_ic(freezer, monkeypatch):
@@ -899,15 +924,15 @@ def _run_checker(monkeypatch, capsys, result):
 
 
 @pytest.mark.parametrize(
-    ("flips", "constant", "code", "text"),
+    ("flips", "scrambled", "code", "text"),
     [((), False, 0, "PASS"),
      ((5,), False, 0, "PASS"),  # 1 of 200 flipped: agreement 0.995
      ((5, 6, 7), False, 1, "FAIL: direction agreement 0.9850 is below the floor"),
      ((), True, 1, "FAIL: signal spearman")],
 )  # fmt: skip
-def test_accuracy_gate_against_a_fixture_reference(reference, monkeypatch, capsys, flips, constant, code, text):
+def test_accuracy_gate_against_a_fixture_reference(reference, monkeypatch, capsys, flips, scrambled, code, text):
     rows, _, _ = reference
-    result = _fixture_pass(rows, flips=flips, scrambled_confidence=constant)
+    result = _fixture_pass(rows, flips=flips, scrambled_confidence=scrambled)
     got, out = _run_checker(monkeypatch, capsys, result)
     assert (got, text in out) == (code, True), out
 

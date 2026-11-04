@@ -97,6 +97,8 @@ prepare and serve, like the rest of the scoring data. A pass must reproduce it:
 - **Signal Spearman >= 0.95**: the rank correlation of your `direction * confidence` with the reference's over the
   pairs where both signals are non-neutral (non-zero); neutral pairs are all ties at 0 and would hide a wrong
   confidence, so they are left out here (with fewer than 30 such pairs the value is undefined and the gate fails).
+  The correlation is of the signed values, so matching signs already earn most of it: 0.95 corresponds to a
+  within-sign confidence rank correlation of about 0.8, and a constant confidence scores about 0.86 and fails.
   This guards against keeping the directions but faking the confidence (for example a constant
   confidence). A faithful fp16 or int8 model scores above 0.99.
 

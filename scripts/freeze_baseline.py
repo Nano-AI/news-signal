@@ -18,7 +18,7 @@ passrun.py; `--force STAGE[,STAGE]` redoes one; `--stages a,b` limits the run):
     probe     (not in the default run) GPU job: the fixture pass in forced wrapper mode, umount and latency probes
     f1        GPU job: the accuracy checker on the baseline, with the gate's own drain (report mode); the freeze
               stops unless it agrees with the CPU reference (agreement >= 0.99, Spearman >= 0.95)
-    f2        GPU job: the bursts benchmark, twice (their agreement is recorded)
+    f2        GPU job: the bursts benchmark, twice; the freeze stops like F1 if either misses a floor
     freeze    write gate.toml, objectives.toml and the OBJECTIVE.md baseline section; print the numbers
 
 There is no sizing stage: MAX_STORIES is a committed constant in passrun.py (30000, above the 19001-story validation
@@ -171,11 +171,12 @@ def _ms(v: float | None) -> str:
     return "n/a" if v is None else f"{v:.1f}"
 
 
-def record_only(latency: dict, throughput: float | None, send_lag: dict, feeds: dict, serve: dict) -> dict:
+def record_only(latency: dict, throughput: float | None, send_lag: dict, feeds: dict, serve: dict, confidence_spearman: float | None = None) -> dict:
     """The numbers that decide nothing, from one pass (F1 score, or F2 values plus its sidecar)."""
     return {"latency_ms": latency, "throughput_signals_per_s": throughput, "send_lag_ms": send_lag,
             "feeds": feeds, "cold_start_s": serve.get("cold_start_s"),
-            "gpu_mem_peak_mib": serve.get("gpu_mem_peak_mib"), "gpu_mem_idle_mib": serve.get("gpu_mem_idle_mib")}  # fmt: skip
+            "gpu_mem_peak_mib": serve.get("gpu_mem_peak_mib"), "gpu_mem_idle_mib": serve.get("gpu_mem_idle_mib"),
+            "confidence_spearman": confidence_spearman}  # fmt: skip
 
 
 def record_line(name: str, r: dict) -> list[str]:
@@ -186,7 +187,8 @@ def record_line(name: str, r: dict) -> list[str]:
     lines = [
         f"- {name}: latency p50 {_ms(lat['p50'])}, p90 {_ms(lat['p90'])}, p99 {_ms(lat['p99'])}, max {_ms(lat['max'])} ms; "
         f"throughput {'n/a' if tp is None else f'{tp:.1f}'} signals/s; send lag p50 {_ms(lag['p50'])}, p90 {_ms(lag['p90'])}, "
-        f"p99 {_ms(lag['p99'])}, max {_ms(lag['max'])} ms; model load (spawn to ready) {cold}; peak GPU memory {mem}."
+        f"p99 {_ms(lag['p99'])}, max {_ms(lag['max'])} ms; model load (spawn to ready) {cold}; peak GPU memory {mem}; "
+        f"within-sign confidence Spearman {'n/a' if r['confidence_spearman'] is None else format(r['confidence_spearman'], '.4f')}."
     ]
     for feed, f in r["feeds"].items():
         lines.append(f"  - feed `{feed}`: {f['pairs']} pairs, p50 {_ms(f['p50'])} ms, p99 {_ms(f['p99'])} ms, first on {f['first']} stories")
@@ -395,7 +397,7 @@ class Freezer:
         gate = tomllib.loads(GATE.read_text())
         fid = res.get("fidelity")
         if not fid or fid["spearman"] is None:
-            sys.exit("[freeze] the baseline accuracy pass has no fidelity against the CPU reference: rerun with --force f1")
+            sys.exit("[freeze] the baseline accuracy pass has no fidelity against the CPU reference: rerun with --force f1 (and the sync stage if the reference was regenerated)")
         if fid["agreement"] < gate["agreement_floor"] or fid["spearman"] < gate["spearman_floor"]:
             sys.exit(
                 f"[freeze] the GPU baseline does not reproduce the CPU reference: agreement {fid['agreement']:.4f} "
@@ -435,10 +437,13 @@ class Freezer:
             over = [f"{k} {lag[k]:.1f} ms > {bound} ms" for k, bound in SEND_LAG_MAX_MS.items() if lag[k] > bound]
             if over:
                 sys.exit(f"[freeze] {p.name}: invalid pass, send lag {', '.join(over)}")
-            agree = last["values"].get("direction_agreement")
-            require_finite(**{f"{p.name} direction_agreement": agree})
-            if agree < tomllib.loads(GATE.read_text())["agreement_floor"]:  # recorded, not enforced: a short pass
-                say(f"WARNING {p.name}: bursts agreement {agree:.4f} is below the gate floor")
+            agree, rho = last["values"].get("direction_agreement"), last["values"].get("signal_spearman")
+            require_finite(**{f"{p.name} direction_agreement": agree, f"{p.name} signal_spearman": rho})
+            floors = tomllib.loads(GATE.read_text())
+            if agree < floors["agreement_floor"] or rho < floors["spearman_floor"]:  # the baseline must pass its own gate
+                sys.exit(f"[freeze] {p.name}: the baseline fails its own bursts gate: agreement {agree:.4f} (floor "
+                         f"{floors['agreement_floor']}), spearman {rho:.4f} (floor {floors['spearman_floor']}). "
+                         "Stop and report; do not change the floors")
             if last["values"].get("reruns"):
                 say(f"{p.name}: the first pass was invalid (send lag), the rerun is the result")
             results.append(last["values"])
@@ -461,6 +466,7 @@ class Freezer:
         bursts_ic = (b1 + b2) / 2
         fid = f1["fidelity"]
         a1, a2 = r1["direction_agreement"], r2["direction_agreement"]
+        sp1, sp2 = r1["signal_spearman"], r2["signal_spearman"]
         gate_now_top = tomllib.loads(GATE.read_text())
         gate_now = gate_now_top["baseline"]
         if not re.fullmatch(r"[0-9a-f]{64}", gate_now["reference_sha256"]):
@@ -473,7 +479,7 @@ class Freezer:
                          ("bursts_ic", repr(bursts_ic)), ("validation_stories", str(s["stories"])),
                          ("scored_pairs", str(s["scored_pairs"])), ("p99_ms", f"[{p1!r}, {p2!r}]"),
                          ("f1_agreement", repr(fid["agreement"])), ("f1_spearman", repr(fid["spearman"])),
-                         ("bursts_agreement", f"[{a1!r}, {a2!r}]")):  # fmt: skip
+                         ("bursts_agreement", f"[{a1!r}, {a2!r}]"), ("bursts_spearman", f"[{sp1!r}, {sp2!r}]")):  # fmt: skip
             set_toml(GATE, key, val, section="baseline")
         GATE.write_text(re.sub(
             r"\A(?:#[^\n]*\n)+", "# Frozen by scripts/freeze_baseline.py from the unmodified serving/ on the target GPU.\n",
@@ -487,11 +493,11 @@ class Freezer:
         ))
         sv = f1.get("serve") or {}
         extra = [
-            record_only(s["latency_ms"], s["throughput_per_s"], s["send_lag_ms"], s.get("feed_latency_ms", {}), sv),
+            record_only(s["latency_ms"], s["throughput_per_s"], s["send_lag_ms"], s.get("feed_latency_ms", {}), sv, fid.get("confidence_spearman")),
             *(record_only({k: r.get(f"{k}_latency_ms") for k in ("p50", "p90", "p99")} | {"max": r.get("max_latency_ms")},
                           r.get("throughput_signals_per_s"),
                           {k: r.get(f"newsd_send_lag_{k}_ms") for k in ("p50", "p90", "p99", "max")},
-                          st.get("feeds", {}), st.get("serve", {}))
+                          st.get("feeds", {}), st.get("serve", {}), (st.get("fidelity") or {}).get("confidence_spearman"))
               for r, st in ((r1, self.stats_of(1)), (r2, self.stats_of(2)))),
         ]  # fmt: skip
         cpu = self.runs / "cpu-acc.json"
@@ -508,7 +514,7 @@ class Freezer:
             f"hidden validation pairs, with a signal Spearman of at least {gate_now_top['spearman_floor']}. Reference: "
             f"{gate_now['reference_pairs']} pairs, sha256 `{gate_now['reference_sha256'][:12]}`. Baseline GPU accuracy "
             f"pass: agreement {fid['agreement']:.4f}, Spearman {fid['spearman']:.4f}. Baseline bursts passes: "
-            f"agreement {a1:.4f} and {a2:.4f}.\n"
+            f"agreement {a1:.4f} and {a2:.4f}, Spearman {sp1:.4f} and {sp2:.4f}.\n"
             f"- Accuracy IC (record only): {ic:.4f} (se {se:.4f}) on {s['stories']} stories, {s['scored_pairs']} scored pairs.\n"
             f"- Bursts: IC {bursts_ic:.4f} (record only, mean of two runs); p99 latency {p1:.1f} ms and {p2:.1f} ms "
             f"(p50 {r1['p50_latency_ms']:.1f} and {r2['p50_latency_ms']:.1f} ms; {r1['stories']:.0f} stories). "
@@ -523,7 +529,7 @@ class Freezer:
         say(f"frozen at commit {head}:")
         print(json.dumps({"ic": ic, "ic_se": se, "bursts_ic": bursts_ic,
                           "f1_agreement": fid["agreement"], "f1_spearman": fid["spearman"],
-                          "bursts_agreement": [a1, a2], "reference_pairs": gate_now["reference_pairs"],
+                          "bursts_agreement": [a1, a2], "bursts_spearman": [sp1, sp2], "reference_pairs": gate_now["reference_pairs"],
                           "validation_stories": s["stories"], "scored_pairs": s["scored_pairs"],
                           "p99_ms": [p1, p2], "relative_noise": noise,
                           "record_only": {"f1": extra[0], "f2": extra[1:]}}, indent=2))  # fmt: skip

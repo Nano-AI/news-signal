@@ -50,6 +50,9 @@ class Fidelity:
     both: int  # pairs the candidate signalled
     non_neutral: int  # pairs where the candidate's and the reference's signal are both non-zero
     spearman: float | None  # rank correlation of the two signals over the non-neutral pairs; None if undefined
+    # Record only, never gated: rank correlation of |signal| over the pairs non-zero and same-sign on both sides
+    # (the within-sign confidence agreement); None below 30 such pairs.
+    confidence_spearman: float | None = None
 
 
 def _ic(x: np.ndarray, y: np.ndarray) -> float | None:
@@ -114,13 +117,14 @@ def fidelity(plan: ReplayPlan, log: PassLog, reference: Mapping[tuple[str, str],
     Direction is the sign of the signal, the same `direction * confidence` as the IC: -1, 0 (neutral, or a zero
     confidence) or +1. Neutral agrees only with neutral. The Spearman is over the pairs where both signals are non-zero:
     the neutral zeros are ties that would otherwise dominate the ranks and hide a faked confidence; it is None
-    (undefined, so a gate fails) below 30 such pairs. Raises ValueError if a measured pair is not in the reference."""
+    (undefined, so a gate fails) below 30 such pairs. A signed 0.95 needs only a within-sign confidence correlation
+    of about 0.8; `confidence_spearman` reports that within-sign correlation, for the record. Raises ValueError if a measured pair is not in the reference."""
     first, _ = first_signals(plan, log)
     keys = [(s.story_id, t) for s in plan.measured for t in s.tickers]
     absent = sum(k not in reference for k in keys)
     if absent:
         raise ValueError(f"{absent} measured pairs are not in the reference")
-    cand, ref, nn_cand, nn_ref = [], [], [], []
+    cand, ref, nn_cand, nn_ref, ss_cand, ss_ref = [], [], [], [], [], []
     agreed = 0
     for key in keys:
         sig = first.get(key)
@@ -131,9 +135,13 @@ def fidelity(plan: ReplayPlan, log: PassLog, reference: Mapping[tuple[str, str],
             if cand[-1] and ref[-1]:
                 nn_cand.append(cand[-1])
                 nn_ref.append(ref[-1])
+                if cand[-1] * ref[-1] > 0:
+                    ss_cand.append(abs(cand[-1]))
+                    ss_ref.append(abs(ref[-1]))
     return Fidelity(
         pairs=len(keys), agreed=agreed, agreement=agreed / len(keys) if keys else 0.0, both=len(cand), non_neutral=len(nn_cand),
         spearman=_ic(np.array(nn_cand), np.array(nn_ref)),
+        confidence_spearman=_ic(np.array(ss_cand), np.array(ss_ref)),
     )
 
 

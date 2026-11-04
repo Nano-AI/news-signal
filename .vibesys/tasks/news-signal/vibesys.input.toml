@@ -9,7 +9,7 @@ nodes = 1
 accelerators_per_node = 1
 accelerator_backend = "rocm"
 
-# Prediction-quality gate: the replayed validation sample must keep the frozen baseline's IC (see gate.toml).
+# Prediction-quality gate: the replayed validation sample must agree with the baseline FinBERT's hidden reference signals (see gate.toml).
 [accuracy]
 command = ["uv", "run", "python", "${PROJECT_ROOT}/.vibesys/tasks/news-signal/accuracy_checker/checker.py"]
 timeout_seconds = 4800

@@ -138,7 +138,7 @@ def records_for(score, gate: dict, directions: set[int], first_invalid=None, ser
     return [HELLO, {"kind": "result", "label": "", "values": values}]
 
 
-def stats_for(score, serve=None) -> dict:
+def stats_for(score, serve=None, fid=None) -> dict:
     """Every record-only number of a pass, including what a result row cannot hold (null, per-feed maps)."""
     serve = serve or {}
     return {
@@ -147,6 +147,7 @@ def stats_for(score, serve=None) -> dict:
         "send_lag_ms": score.send_lag_ms,
         "feeds": score.feed_latency_ms,
         "serve": dataclasses.asdict(serve) if dataclasses.is_dataclass(serve) else serve,
+        "fidelity": dataclasses.asdict(fid) if fid is not None else None,  # confidence_spearman is record only
     }
 
 
@@ -187,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     if records[-1]["kind"] == "result":  # sidecar next to the stream: <vs-output>.stats.json
         with contextlib.suppress(OSError):  # record only: it must never fail a round whose result is written
             a.vs_output.with_name(a.vs_output.name + ".stats.json").write_text(
-                json.dumps(stats_for(result.score, result.serve), indent=2) + "\n"
+                json.dumps(stats_for(result.score, result.serve, fid), indent=2) + "\n"
             )
     final = records[-1]
     if final["kind"] == "error":

@@ -140,6 +140,7 @@ _BASELINE_KEYS = {
     "f1_agreement": float,
     "f1_spearman": float,
     "bursts_agreement": list,
+    "bursts_spearman": list,
 }
 
 
@@ -158,7 +159,7 @@ def load_gate() -> dict:
                 ok = False
             if not ok:
                 raise PassError(f"gate.toml: {key} must be {kind.__name__}")
-    for key in ("p99_ms", "bursts_agreement"):
+    for key in ("p99_ms", "bursts_agreement", "bursts_spearman"):
         if len(gate["baseline"][key]) != 2:
             raise PassError(f"gate.toml: baseline.{key} must have two entries")
     return gate

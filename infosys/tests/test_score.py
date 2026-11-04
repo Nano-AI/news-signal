@@ -283,3 +283,14 @@ def test_spearman_is_undefined_below_30_non_neutral_pairs():
     plan, log, ref = _fid_case(29)
     f = fidelity(plan, log, ref)
     assert f.non_neutral == 29 and f.spearman is None
+
+
+def test_confidence_spearman_is_the_within_sign_rank_correlation_and_is_record_only():
+    exact = fidelity(*_neutral_heavy(lambda c: c))
+    assert exact.confidence_spearman == pytest.approx(1.0)
+    constant = fidelity(*_neutral_heavy(lambda c: 0.5))
+    assert constant.confidence_spearman is None  # constant |signal|: undefined
+    reversed_ = fidelity(*_neutral_heavy(lambda c: 1 - c))
+    assert reversed_.confidence_spearman == pytest.approx(-1.0)
+    plan, log, ref = _fid_case(29)
+    assert fidelity(plan, log, ref).confidence_spearman is None  # fewer than 30 pairs

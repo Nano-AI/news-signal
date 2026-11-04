@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if fid is not None:
         print(f"fidelity: agreement={_fmt(fid.agreement)} spearman={_fmt(fid.spearman)} pairs={fid.pairs} "
-              f"signalled={fid.both} non_neutral={fid.non_neutral}")  # fmt: skip
+              f"signalled={fid.both} non_neutral={fid.non_neutral} confidence_spearman={_fmt(fid.confidence_spearman)}")  # fmt: skip
     per_horizon = {}
     for h in horizons or [gate["h_minutes"]]:
         hs = s if h == gate["h_minutes"] else rescore(result, h)
