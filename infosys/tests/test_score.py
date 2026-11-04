@@ -255,3 +255,31 @@ def test_fidelity_ignores_duplicates_and_unmeasured_signals_and_refuses_an_uncov
     assert fidelity(plan, extra, ref).agreement == 1.0  # the later duplicate and the foreign signal do not count
     with pytest.raises(ValueError, match="not in the reference"):
         fidelity(plan, log, {k: v for k, v in ref.items() if k != ("s3", "T03")})
+
+
+def _neutral_heavy(transform):
+    """90 pairs, 60 of them neutral in the reference (signal 0); the candidate keeps every direction and applies
+    `transform` to the confidence of the 30 others, which have distinct confidences."""
+    n = 90
+    stories = [_story(i, (f"T{i:02d}",)) for i in range(n)]
+    ref, signals = {}, []
+    for i in range(n):
+        d = (1, -1)[i % 2] if i < 30 else 0
+        c = (i + 1) / (n + 1) if d else 0.9
+        ref[(f"s{i}", f"T{i:02d}")] = d * c
+        signals.append(_sig(f"s{i}", f"T{i:02d}", direction=d, confidence=transform(c) if d else c))
+    return _plan(stories, [1.0] * n), _log(signals), ref
+
+
+def test_spearman_is_over_non_neutral_pairs_so_neutral_ties_cannot_hide_a_constant_confidence():
+    exact = fidelity(*_neutral_heavy(lambda c: c))
+    assert exact.spearman == pytest.approx(1.0) and exact.non_neutral == 30
+    assert fidelity(*_neutral_heavy(lambda c: c**1.1)).spearman == pytest.approx(1.0)  # monotone: ranks unchanged
+    constant = fidelity(*_neutral_heavy(lambda c: 0.5))
+    assert constant.agreement == 1.0 and constant.spearman is not None and constant.spearman < 0.95
+
+
+def test_spearman_is_undefined_below_30_non_neutral_pairs():
+    plan, log, ref = _fid_case(29)
+    f = fidelity(plan, log, ref)
+    assert f.non_neutral == 29 and f.spearman is None

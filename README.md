@@ -93,7 +93,7 @@ unmodified model's signal for every validation `(story, ticker)` pair, computed 
 and stored in the scoring data (`reference/validation.jsonl.gz`), so the hiding wrapper hides it from the
 candidate. Its sha256 is pinned in `gate.toml`, and a missing or different file fails the gate closed. A candidate
 must agree with the reference direction (sign of `direction * confidence`; neutral agrees only with neutral; a
-missed pair is a disagreement) on at least 99% of pairs, with a signal Spearman of at least 0.95. The reference is
+missed pair is a disagreement) on at least 99% of pairs, with a signal Spearman of at least 0.95, computed over the pairs where both signals are non-neutral (the neutral zeros are ties that would hide a constant or faked confidence; below 30 such pairs it is undefined and fails). The reference is
 derived from private data and is never committed.
 
 Why not an IC floor: on the real validation split the baseline's IC is indistinguishable from zero at every

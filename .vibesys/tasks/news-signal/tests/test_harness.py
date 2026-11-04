@@ -64,11 +64,11 @@ def _gate(frozen=True) -> dict:
     }  # fmt: skip
 
 
-FID = Fidelity(pairs=1000, agreed=1000, agreement=1.0, both=1000, spearman=1.0)
+FID = Fidelity(pairs=1000, agreed=1000, agreement=1.0, both=1000, non_neutral=600, spearman=1.0)
 
 
 def _fid(agreement=1.0, spearman=1.0) -> Fidelity:
-    return Fidelity(pairs=1000, agreed=round(agreement * 1000), agreement=agreement, both=1000, spearman=spearman)
+    return Fidelity(pairs=1000, agreed=round(agreement * 1000), agreement=agreement, both=1000, non_neutral=600, spearman=spearman)
 
 
 # -- pins and gate file ---------------------------------------------------------------------------------
@@ -490,7 +490,7 @@ def _artifacts(fz, runs, *, ic=0.04125, clean=True, bursts_ic=0.03, lag_p90=1.0,
              "send_lag_ms": {"p50": 0.2, "p90": 0.3, "p99": 0.4, "max": 0.9},
              "feed_latency_ms": FEEDS_STATS if sidecars else {}}  # fmt: skip
     serve = {"cold_start_s": 12.5, "gpu_mem_idle_mib": 300.0, "gpu_mem_peak_mib": 4096.0} if sidecars else {}
-    fidelity = {"pairs": 1000, "agreed": 1000, "agreement": agreement, "both": 1000, "spearman": spearman}
+    fidelity = {"pairs": 1000, "agreed": 1000, "agreement": agreement, "both": 1000, "non_neutral": 600, "spearman": spearman}
     (runs / "f1.json").write_text(json.dumps({"score": score, "serve": serve, "fidelity": fidelity}))
     (runs / "cpu-acc.json").write_text(json.dumps({"horizons": {}}))
     fz.stamp(runs / "f1.json")

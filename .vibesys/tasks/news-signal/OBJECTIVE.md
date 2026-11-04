@@ -95,7 +95,9 @@ prepare and serve, like the rest of the scoring data. A pass must reproduce it:
   signal (`direction = 0`, or `confidence = 0`). Neutral agrees only with neutral. A pair you do not signal counts as
   a disagreement.
 - **Signal Spearman >= 0.95**: the rank correlation of your `direction * confidence` with the reference's over the
-  pairs you signalled. This guards against keeping the directions but faking the confidence (for example a constant
+  pairs where both signals are non-neutral (non-zero); neutral pairs are all ties at 0 and would hide a wrong
+  confidence, so they are left out here (with fewer than 30 such pairs the value is undefined and the gate fails).
+  This guards against keeping the directions but faking the confidence (for example a constant
   confidence). A faithful fp16 or int8 model scores above 0.99.
 
 Precision changes, fused kernels, batching, compilation and distillation are all

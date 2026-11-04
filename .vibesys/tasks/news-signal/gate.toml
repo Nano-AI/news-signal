@@ -1,6 +1,6 @@
 # PLACEHOLDER VALUES. The baseline is pending: `frozen = false` makes the accuracy gate fail until
 # scripts/freeze_baseline.py measures the unmodified serving/ on real data and rewrites this file.
-infosys_sha256 = "db0499e8921ba2139a885a5b0588ce3506ad91bf1c085ea5b87f6426795ebd09"
+infosys_sha256 = "5c3ddfff58f79236d7a1c238bed8228d817beb413d86ae3a59ff04639d284294"
 repo_sha256 = "73aabd26acf46e7a4dddfce6ca12b96148e74ef6518eb7a5a019e4efabcddf13"
 h_minutes = 5
 h_reason = "PENDING: fixed at 5 min by scripts/freeze_baseline.py (IC is record only)"
@@ -8,7 +8,7 @@ max_missed_frac = 0.001
 max_duplicate_frac = 0.001
 max_invalid = 0
 agreement_floor = 0.99  # fraction of hidden reference pairs whose signal direction the candidate reproduces
-spearman_floor = 0.95  # Spearman of candidate vs reference signal over the pairs the candidate signalled
+spearman_floor = 0.95  # Spearman of candidate vs reference signal over pairs non-neutral on both sides (undefined below 30 = fail)
 
 [baseline]
 frozen = false
