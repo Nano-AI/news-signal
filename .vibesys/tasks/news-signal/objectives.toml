@@ -8,5 +8,5 @@ name = "p50_latency_ms"
 direction = "min"
 
 [pareto]
-# PLACEHOLDER until the baseline is frozen: scripts/freeze_baseline.py sets it from the two baseline runs.
+# Set by scripts/freeze_baseline.py: max(0.03, the relative spread of the two baseline p99 runs, rounded up).
 relative_noise = 0.03

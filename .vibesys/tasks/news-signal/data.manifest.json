@@ -1,1 +1,89 @@
-{"format": 1, "pending": true, "files": {}, "tickers": []}
+{
+  "dropped": {
+    "duplicates": 0,
+    "no_universe_ticker": 0,
+    "roundups": 27125
+  },
+  "files": {
+    "bars-holdout.npz": {
+      "rows": 4914008,
+      "sha256": "427ff9ee03777b3e9d0c3859b0f61267d38b36c52a9fe3389e4d301eb62a50dd"
+    },
+    "bars-train.npz": {
+      "rows": 5810966,
+      "sha256": "19ade9e93f0d29471d8c048c04b4bea5a57e984377c7090683f3d449bc19db18"
+    },
+    "bars-validation.npz": {
+      "rows": 1820808,
+      "sha256": "08c0399f4875027a6fcf8ef0bb1653118590307962da5536ad239d371f8d1dc7"
+    },
+    "stories-holdout.jsonl.gz": {
+      "rows": 44661,
+      "sha256": "61ec1f1795a501fd337d110a51f3ad5508418ab6912abeb644d1ee2be6c26275"
+    },
+    "stories-train.jsonl.gz": {
+      "rows": 50961,
+      "sha256": "caa96350a920ec0765327622734b847dd17d5c7043cba7441fff1b0b4b80afaa"
+    },
+    "stories-validation.jsonl.gz": {
+      "rows": 19001,
+      "sha256": "f47fe90185ffa208330b69aeb8601addc31891fd5327acce7222ccd9d1441fc7"
+    }
+  },
+  "format": 1,
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "TSLA",
+    "AVGO",
+    "JPM",
+    "V",
+    "MA",
+    "UNH",
+    "XOM",
+    "JNJ",
+    "WMT",
+    "PG",
+    "HD",
+    "COST",
+    "BAC",
+    "NFLX",
+    "AMD",
+    "CRM",
+    "ORCL",
+    "KO",
+    "PEP",
+    "LLY"
+  ],
+  "universe": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "TSLA",
+    "AVGO",
+    "JPM",
+    "V",
+    "MA",
+    "UNH",
+    "XOM",
+    "JNJ",
+    "WMT",
+    "PG",
+    "HD",
+    "COST",
+    "BAC",
+    "NFLX",
+    "AMD",
+    "CRM",
+    "ORCL",
+    "KO",
+    "PEP",
+    "LLY"
+  ],
+  "window_end": "2026-11-03"
+}

@@ -125,8 +125,34 @@ accuracy gate on real data stays the gate. Keep `--device cpu` working in `servi
 
 ## Baseline
 
-Pending: the baseline has not been frozen. The numbers (the reference pair count and digest, the baseline's own
-agreement and Spearman on the GPU accuracy pass and on both bursts passes, IC (record only), p99 latency of the
-unmodified `serving/` on two runs, validation story count, scored pairs, and a record-only block with p90 and max latency,
-throughput, send lag, model load time, peak GPU memory and per-feed latency) are written here and into `gate.toml` by
-`scripts/freeze_baseline.py`.
+Unmodified `serving/` (plain FinBERT, one headline per call) at commit `5e54391` on 1x MI210, validation split, H = fixed at 5 min: IC is record only (see cpu-acc.json for the table). `serving/` tree a17838d58bfd, task files 1c48b1e8528c; uncommitted task files: 1.
+
+- Quality gate: agree with the original FinBERT (fp32, CPU) on at least 99% of hidden validation pairs, with a signal Spearman of at least 0.95. Reference: 22207 pairs, sha256 `3a1fa375b29a`. Baseline GPU accuracy pass: agreement 1.0000, Spearman 1.0000. Baseline bursts passes: agreement 1.0000 and 1.0000, Spearman 1.0000 and 1.0000.
+- Accuracy IC (record only): 0.0071 (se 0.0117) on 19001 stories, 9316 scored pairs.
+- Bursts: IC -0.0194 (record only, mean of two runs); p99 latency 88.5 ms and 86.2 ms (p50 14.6 and 14.5 ms; 724 stories). Pareto `relative_noise` = 0.03.
+
+### Baseline (record only)
+
+These decide nothing: no gate, objective, floor or validity rule reads them.
+
+- Accuracy pass (F1): latency p50 9936.7, p90 21550.6, p99 22246.3, max 22393.6 ms; throughput 104.7 signals/s; send lag p50 0.6, p90 1.1, p99 11.2, max 95.4 ms; model load (spawn to ready) 37.7 s; peak GPU memory 975 MiB (idle 10.5 MiB); within-sign confidence Spearman 1.0000.
+  - feed `benzinga`: 22207 pairs, p50 9897.6 ms, p99 22209.8 ms, first on 3855 stories
+  - feed `edgar`: 0 pairs, p50 n/a ms, p99 n/a ms, first on 0 stories
+  - feed `syn-0`: 21076 pairs, p50 9852.4 ms, p99 22187.4 ms, first on 4443 stories
+  - feed `syn-1`: 21009 pairs, p50 9751.5 ms, p99 22133.5 ms, first on 3388 stories
+  - feed `syn-2`: 19856 pairs, p50 9964.5 ms, p99 22199.5 ms, first on 1146 stories
+  - feed `syn-3`: 21706 pairs, p50 9905.9 ms, p99 22216.0 ms, first on 6169 stories
+- Bursts run 1: latency p50 14.6, p90 57.9, p99 88.5, max 112.4 ms; throughput 4.3 signals/s; send lag p50 0.7, p90 1.5, p99 7.9, max 31.1 ms; model load (spawn to ready) 45.5 s; peak GPU memory 976 MiB (idle 10.5 MiB); within-sign confidence Spearman 1.0000.
+  - feed `benzinga`: 779 pairs, p50 -2.7 ms, p99 14.6 ms, first on 154 stories
+  - feed `edgar`: 0 pairs, p50 n/a ms, p99 n/a ms, first on 0 stories
+  - feed `syn-0`: 750 pairs, p50 -40.6 ms, p99 15.3 ms, first on 159 stories
+  - feed `syn-1`: 746 pairs, p50 -113.6 ms, p99 87.2 ms, first on 135 stories
+  - feed `syn-2`: 703 pairs, p50 -19.9 ms, p99 14.4 ms, first on 46 stories
+  - feed `syn-3`: 768 pairs, p50 -3.6 ms, p99 73.2 ms, first on 230 stories
+- Bursts run 2: latency p50 14.5, p90 53.5, p99 86.2, max 97.4 ms; throughput 4.3 signals/s; send lag p50 0.7, p90 1.4, p99 12.2, max 19.1 ms; model load (spawn to ready) 40.1 s; peak GPU memory 975 MiB (idle 10.5 MiB); within-sign confidence Spearman 1.0000.
+  - feed `benzinga`: 779 pairs, p50 -1.4 ms, p99 15.1 ms, first on 154 stories
+  - feed `edgar`: 0 pairs, p50 n/a ms, p99 n/a ms, first on 0 stories
+  - feed `syn-0`: 750 pairs, p50 -39.9 ms, p99 15.0 ms, first on 159 stories
+  - feed `syn-1`: 746 pairs, p50 -118.3 ms, p99 85.9 ms, first on 135 stories
+  - feed `syn-2`: 703 pairs, p50 -20.5 ms, p99 14.8 ms, first on 46 stories
+  - feed `syn-3`: 768 pairs, p50 -3.7 ms, p99 73.2 ms, first on 230 stories

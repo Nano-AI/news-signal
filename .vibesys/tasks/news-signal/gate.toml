@@ -1,9 +1,8 @@
-# PLACEHOLDER VALUES. The baseline is pending: `frozen = false` makes the accuracy gate fail until
-# scripts/freeze_baseline.py measures the unmodified serving/ on real data and rewrites this file.
+# Frozen by scripts/freeze_baseline.py from the unmodified serving/ on the target GPU.
 infosys_sha256 = "22124408843bce53210446505efe875df493fb822d85caf5621f9dcf5019a9dc"
 repo_sha256 = "73aabd26acf46e7a4dddfce6ca12b96148e74ef6518eb7a5a019e4efabcddf13"
 h_minutes = 5
-h_reason = "PENDING: fixed at 5 min by scripts/freeze_baseline.py (IC is record only)"
+h_reason = "fixed at 5 min: IC is record only (see cpu-acc.json for the table)"
 max_missed_frac = 0.001
 max_duplicate_frac = 0.001
 max_invalid = 0
@@ -12,16 +11,16 @@ spearman_floor = 0.95  # signed Spearman of candidate vs reference signal over p
 # 0.95 signed ~ within-sign confidence rank correlation >= about 0.8; a constant confidence scores about 0.86 and fails
 
 [baseline]
-frozen = false
-ic = 0.0  # IC fields are record only: nothing decides on them
-ic_se = 0.0
-bursts_ic = 0.0  # PLACEHOLDER: mean IC of the two baseline bursts runs
-validation_stories = 0
-scored_pairs = 0
-p99_ms = [0.0, 0.0]
-reference_sha256 = ""  # PLACEHOLDER: sha256 of <store>/reference/validation.jsonl.gz, pinned by the cpu-acc stage
-reference_pairs = 0
-f1_agreement = 0.0  # PLACEHOLDER: GPU baseline accuracy pass vs the CPU reference
-f1_spearman = 0.0
-bursts_spearman = [0.0, 0.0]  # PLACEHOLDER: signal Spearman of the two baseline bursts passes
-bursts_agreement = [0.0, 0.0]  # PLACEHOLDER: agreement of the two baseline bursts passes
+frozen = true
+ic = 0.007083156391428483
+ic_se = 0.011732902515988556
+bursts_ic = -0.019356227616282133
+validation_stories = 19001
+scored_pairs = 9316
+p99_ms = [88.48893349990256, 86.19444960728289]
+reference_sha256 = "3a1fa375b29a31e50c445f5732e78f719d8f47593b1cc7b1651f64a0a33a9712"
+reference_pairs = 22207
+f1_agreement = 1.0
+f1_spearman = 0.9999999998691108
+bursts_spearman = [0.9999999999999999, 0.9999999999999999]
+bursts_agreement = [1.0, 1.0]
