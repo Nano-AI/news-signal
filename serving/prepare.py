@@ -1,7 +1,9 @@
-"""No-op prepare: the baseline does not train."""
+"""Prepare: no training; builds and verifies the native runtime (failure only disables it)."""
 
 import argparse
 from pathlib import Path
+
+from serving.native import prepare_native
 
 
 def main() -> None:
@@ -9,7 +11,9 @@ def main() -> None:
     p.add_argument("--train", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--device", required=True, choices=["cuda", "cpu"])
-    Path(p.parse_args().out).mkdir(parents=True, exist_ok=True)
+    a = p.parse_args()
+    Path(a.out).mkdir(parents=True, exist_ok=True)
+    prepare_native(a.train, a.out, a.device)
 
 
 if __name__ == "__main__":
