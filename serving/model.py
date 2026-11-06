@@ -50,8 +50,11 @@ def load_kernels(prepared):
     if path is None or not path.exists():
         return None
     try:
-        return ctypes.CDLL(str(path))
-    except OSError:
+        lib = ctypes.CDLL(str(path))
+        for name in ("launch_emb_ln", "launch_add_ln", "launch_attn"):
+            getattr(lib, name).restype = ctypes.c_int
+        return lib
+    except (OSError, AttributeError):
         return None
 
 
@@ -117,17 +120,19 @@ class FusedBert:
         P = lambda t: ctypes.c_void_p(t.data_ptr())
         eps, scale = ctypes.c_float(self.eps), ctypes.c_float((H // nh) ** -0.5)
         x = torch.empty(B * S, H, dtype=self.dtype, device=input_ids.device)
-        lib.launch_emb_ln(P(input_ids), P(token_type_ids), P(self.word), P(self.pos), P(self.tok),
+        err = lib.launch_emb_ln(P(input_ids), P(token_type_ids), P(self.word), P(self.pos), P(self.tok),
                           P(self.emb_ln[0]), P(self.emb_ln[1]), P(x), B * S, S, H, eps, st)
         for (qw, qb, ow, ob, l1w, l1b, iw, ib, dw, db, l2w, l2b) in self.layers:
             qkv = torch.addmm(qb, x, qw.t())
             a = torch.empty(B * S, H, dtype=self.dtype, device=x.device)
-            lib.launch_attn(P(qkv), P(attention_mask), P(a), B, S, nh, scale, st)
+            err |= lib.launch_attn(P(qkv), P(attention_mask), P(a), B, S, nh, scale, st)
             h = torch.addmm(ob, a, ow.t())
-            lib.launch_add_ln(P(x), P(h), P(l1w), P(l1b), P(x), B * S, H, eps, st)
+            err |= lib.launch_add_ln(P(x), P(h), P(l1w), P(l1b), P(x), B * S, H, eps, st)
             f = F.gelu(torch.addmm(ib, x, iw.t()))
             h = torch.addmm(db, f, dw.t())
-            lib.launch_add_ln(P(x), P(h), P(l2w), P(l2b), P(x), B * S, H, eps, st)
+            err |= lib.launch_add_ln(P(x), P(h), P(l2w), P(l2b), P(x), B * S, H, eps, st)
+        if err:
+            raise RuntimeError("fused_hip kernel launch failed")
         pooled = torch.tanh(torch.addmm(self.pool[1], x.view(B, S, H)[:, 0], self.pool[0].t()))
         logits = torch.addmm(self.cls[1], pooled, self.cls[0].t())
         return torch.softmax(logits.float(), dim=-1)

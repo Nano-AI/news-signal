@@ -111,17 +111,20 @@ __global__ void attn_k(const __half* qkv, const long* mask, __half* out, int S, 
 }
 
 extern "C" {
-void launch_emb_ln(const long* ids, const long* tt, const void* word, const void* pos, const void* tok, const void* g,
+int launch_emb_ln(const long* ids, const long* tt, const void* word, const void* pos, const void* tok, const void* g,
                    const void* b, void* out, int rows, int S, int H, float eps, hipStream_t st) {
   emb_ln_k<<<rows, LN_THREADS, 0, st>>>(ids, tt, (const __half*)word, (const __half*)pos, (const __half*)tok,
                                         (const __half*)g, (const __half*)b, (__half*)out, S, H, eps);
+  return (int)hipGetLastError();
 }
-void launch_add_ln(const void* x, const void* h, const void* g, const void* b, void* out, int rows, int H, float eps,
+int launch_add_ln(const void* x, const void* h, const void* g, const void* b, void* out, int rows, int H, float eps,
                    hipStream_t st) {
   add_ln_k<<<rows, LN_THREADS, 0, st>>>((const __half*)x, (const __half*)h, (const __half*)g, (const __half*)b,
                                         (__half*)out, H, eps);
+  return (int)hipGetLastError();
 }
-void launch_attn(const void* qkv, const long* mask, void* out, int B, int S, int nh, float scale, hipStream_t st) {
+int launch_attn(const void* qkv, const long* mask, void* out, int B, int S, int nh, float scale, hipStream_t st) {
   attn_k<<<B * nh, 64, 0, st>>>((const __half*)qkv, mask, (__half*)out, S, nh, scale);
+  return (int)hipGetLastError();
 }
 }

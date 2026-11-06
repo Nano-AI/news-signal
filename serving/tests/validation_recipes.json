@@ -33,6 +33,28 @@
    ],
    "timeout_seconds": 600,
    "purpose": "FusedBert fp32 CPU matches HF probs (<1e-4, same argmax) with SDPA and explicit attention, padding rows do not change real rows, and _capture uses the fused forward rather than self.model."
+  },
+  {
+   "name": "hip-kernel-tests",
+   "command": "PY=python3; [ -x .venv/bin/python ] && PY=.venv/bin/python; if ! $PY -c 'import torch, transformers' 2>/dev/null; then echo 'torch/transformers unavailable here; skipping'; exit 0; fi; $PY -m pytest -q serving/tests/test_hip_kernels.py serving/tests/test_fused.py",
+   "input_paths": [
+    "serving/__init__.py",
+    "serving/model.py",
+    "serving/kernels/bert_fused.hip",
+    "serving/tests/test_hip_kernels.py",
+    "serving/tests/test_fused.py"
+   ],
+   "timeout_seconds": 600,
+   "purpose": "numpy reference of add_ln/attn/emb_ln matches torch fused math, HIP arm registered first, absent library falls back; GPU parity test skips without CUDA."
+  },
+  {
+   "name": "hip-compile",
+   "command": "if command -v hipcc >/dev/null 2>&1; then hipcc -O3 --offload-arch=gfx90a -shared -fPIC serving/kernels/bert_fused.hip -o /tmp/bert_fused_check.so; else echo 'hipcc unavailable; skipping'; fi",
+   "input_paths": [
+    "serving/kernels/bert_fused.hip"
+   ],
+   "timeout_seconds": 600,
+   "purpose": "The HIP source compiles for gfx90a when hipcc is present."
   }
  ]
 }

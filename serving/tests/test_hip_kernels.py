@@ -63,7 +63,7 @@ def test_hip_arm_registered_first_and_absent_lib_is_none(tmp_path):
 def test_kernel_source_has_launchers():
     s = SRC.read_text()
     for name in ("launch_emb_ln", "launch_add_ln", "launch_attn"):
-        assert f'void {name}(' in s
+        assert f'int {name}(' in s
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
