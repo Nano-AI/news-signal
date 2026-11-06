@@ -30,6 +30,7 @@
 #include <torch/csrc/jit/serialization/pickle.h>
 #ifdef USE_ROCM
 #include <ATen/hip/HIPGraph.h>
+#include <ATen/cuda/tunable/Tunable.h>
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime_api.h>
 #define GPU(x) hip##x
@@ -347,6 +348,7 @@ struct Model {
   Meta meta;
   at::Device dev = at::kCPU;
   at::ScalarType dt = at::kHalf;
+  vector<at::Tensor> QW, QB;  // arm B: QKV weight/bias with 1/sqrt(d) folded into the Q rows (cuda only)
 
   void load(const string& dir, const string& device) {
     std::ifstream f(dir + "/meta.txt");
@@ -368,9 +370,20 @@ struct Model {
     dt = cuda ? at::kHalf : at::kFloat;
     for (size_t i = 0; i < lst.size(); i++) W.push_back(lst.get(i).toTensor().to(dev, dt));
     layers = ((int)W.size() - 9) / 12;
+    if (cuda) {
+      int64_t H = W[0].size(1);
+      double scale = std::pow((double)(H / meta.heads), -0.5);
+      for (int l = 0; l < layers; l++) {
+        const at::Tensor* w = &W[5 + 12 * l];
+        QW.push_back(w[0].clone());
+        QB.push_back(w[1].clone());
+        QW.back().slice(0, 0, H).mul_(scale);
+        QB.back().slice(0, 0, H).mul_(scale);
+      }
+    }
   }
-  // in: [2, B, S] int64 (ids, attention mask)
-  at::Tensor forward(const at::Tensor& in) const {
+  // in: [2, B, S] int64 (ids, attention mask). armb: folded Q scale, fused bias+GELU, one contiguous q/k/v copy.
+  at::Tensor forward(const at::Tensor& in, bool armb = false) const {
     int64_t B = in.size(1), S = in.size(2), H = W[0].size(1), nh = meta.heads, d = H / nh;
     auto ids = in[0], am = in[1];
     auto x = at::index_select(W[0], 0, ids.reshape({-1})).view({B, S, H}) + W[1].slice(0, 0, S) + W[2];
@@ -380,14 +393,19 @@ struct Model {
     double scale = std::pow((double)d, -0.5);
     for (int l = 0; l < layers; l++) {
       const at::Tensor* w = &W[5 + 12 * l];
-      auto qkv = at::addmm(w[1], x.view({B * S, H}), w[0].t()).view({B, S, 3, nh, d});
-      auto p = qkv.permute({2, 0, 3, 1, 4});
+      at::Tensor qkv, p, att;
+      if (armb) qkv = at::addmm(QB[l], x.view({B * S, H}), QW[l].t()).view({B, S, 3, nh, d});
+      else qkv = at::addmm(w[1], x.view({B * S, H}), w[0].t()).view({B, S, 3, nh, d});
+      p = qkv.permute({2, 0, 3, 1, 4});
+      if (armb) p = p.contiguous();
       auto q = p[0], k = p[1], v = p[2];
-      auto att = at::softmax(at::matmul(q, k.transpose(-1, -2)) * scale + mask, -1);
+      if (armb) att = at::softmax(at::matmul(q, k.transpose(-1, -2)) + mask, -1);
+      else att = at::softmax(at::matmul(q, k.transpose(-1, -2)) * scale + mask, -1);
       auto a = at::matmul(att, v).transpose(1, 2).reshape({B * S, H});
       auto h = at::addmm(w[3], a, w[2].t()).view({B, S, H});
       x = at::layer_norm(x + h, {H}, w[4], w[5], meta.eps);
-      auto f = at::gelu(at::addmm(w[7], x.view({B * S, H}), w[6].t()));
+      auto f = armb ? at::_addmm_activation(w[7], x.view({B * S, H}), w[6].t(), 1, 1, /*use_gelu=*/true)
+                    : at::gelu(at::addmm(w[7], x.view({B * S, H}), w[6].t()));
       h = at::addmm(w[9], f, w[8].t()).view({B, S, H});
       x = at::layer_norm(x + h, {H}, w[10], w[11], meta.eps);
     }
@@ -409,7 +427,53 @@ struct Runner {
   int pad_id = 0;
   std::unique_ptr<gs::HIPStream> st;
   Bucket bk[NB][NS];
+  bool armb[NB][NS] = {};
   GPU(Event_t) ev{};
+
+  static bool is_file(const string& f) { std::ifstream x(f); return (bool)x; }
+  // Reads <dir>/arms.json (one bucket per line, written by --tune). Anything missing or odd means arm A, untuned.
+  // Returns per-bucket arm names ("A", "B", "A+tuned", "B+tuned").
+  static void read_arms(const string& dir, string arms[NB][NS]) {
+    try {
+      std::ifstream f(dir + "/arms.json");
+      string line;
+      while (std::getline(f, line)) {
+        size_t a = line.find('"'), x, e;
+        if (a == string::npos) continue;
+        int b = std::atoi(line.c_str() + a + 1);
+        x = line.find('x', a);
+        if (x == string::npos) continue;
+        int s = std::atoi(line.c_str() + x + 1);
+        size_t k = line.find("\"arm\"");
+        if (k == string::npos) continue;
+        a = line.find('"', k + 5);
+        if (a == string::npos) continue;
+        e = line.find('"', a + 1);
+        if (e == string::npos) continue;
+        string arm = line.substr(a + 1, e - a - 1);
+        if (arm != "A" && arm != "B" && arm != "A+tuned" && arm != "B+tuned") continue;
+        for (int bi = 0; bi < NB; bi++)
+          for (int si = 0; si < NS; si++)
+            if (BATCH_BUCKETS[bi] == b && SEQ_BUCKETS[si] == s) arms[bi][si] = arm;
+      }
+    } catch (...) {
+      for (int bi = 0; bi < NB; bi++)
+        for (int si = 0; si < NS; si++) arms[bi][si] = "A";
+    }
+  }
+  // Serve-time tunable-op configuration: only loads results, never tunes.
+  static bool load_tunable(const string& dir) {
+    try {
+      string csv = dir + "/tunableop_results.csv";
+      if (!is_file(csv)) return false;
+      auto* ctx = at::cuda::tunable::getTuningContext();
+      ctx->EnableTuning(false);
+      ctx->WriteFileOnExit(false);
+      ctx->SetFilename(csv, false);
+      ctx->GetTuningResultsManager();  // first access reads the file
+      return true;
+    } catch (...) { return false; }
+  }
 
   void init(const string& dir, const string& device, int pad) {
     cuda = device == "cuda";
@@ -422,23 +486,38 @@ struct Runner {
     GPU(EventCreateWithFlags)(&ev, GPU(EventDisableTiming));
     auto pool = at::cuda::graph_pool_handle();
     auto lopt = at::TensorOptions().dtype(at::kLong);
+    string arms[NB][NS];
+    for (int bi = 0; bi < NB; bi++)
+      for (int si = 0; si < NS; si++) arms[bi][si] = "A";
+    read_arms(dir, arms);
+    bool have_csv = load_tunable(dir);
+    int nB = 0, nT = 0;
     for (int bi = 0; bi < NB; bi++)
       for (int si = 0; si < NS; si++) {
         int b = BATCH_BUCKETS[bi], s = SEQ_BUCKETS[si];
         Bucket& k = bk[bi][si];
+        const string& arm = arms[bi][si];
+        armb[bi][si] = arm[0] == 'B';
+        bool tuned = have_csv && arm.size() > 1;
+        nB += armb[bi][si];
+        nT += tuned;
+        try {
+          at::cuda::tunable::getTuningContext()->EnableTunableOp(tuned);
+        } catch (...) {}
         k.dev_in = at::zeros({2, b, s}, lopt.device(model.dev));
         k.dev_in[0].fill_(pad_id);
         k.dev_in[1].select(1, 0).fill_(1);
         k.host_in = at::empty({2, b, s}, lopt.pinned_memory(true));
         k.host_out = at::empty({b, 3}, at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
-        for (int i = 0; i < 3; i++) model.forward(k.dev_in);
+        for (int i = 0; i < 3; i++) model.forward(k.dev_in, armb[bi][si]);
         GPU(StreamSynchronize)(st->stream());
         k.g.reset(new at::cuda::CUDAGraph());
         k.g->capture_begin(pool);
-        k.out_dev = model.forward(k.dev_in);
+        k.out_dev = model.forward(k.dev_in, armb[bi][si]);
         k.g->capture_end();
         GPU(StreamSynchronize)(st->stream());
       }
+    std::fprintf(stderr, "serving-native: arms: %d/%d buckets arm B, %d tuned\n", nB, NB * NS, nT);
   }
   static int pick(const int* t, int n, int v) {
     for (int i = 0; i < n; i++) if (t[i] >= v) return i;
@@ -470,7 +549,7 @@ struct Runner {
       GPU(MemcpyAsync)(k.host_out.data_ptr(), k.out_dev.data_ptr(), (size_t)b * 3 * 4, GPU(MemcpyDeviceToHost), st->stream());
       GPU(EventRecord)(ev, st->stream());
     } else {
-      k.host_out = model.forward(host).contiguous();
+      k.host_out = model.forward(host).contiguous();  // arm A
     }
     return &k;
   }
@@ -966,6 +1045,130 @@ static int selftest(const string& dir, const string& device) {
   std::fprintf(stderr, "selftest: tokenizer ok\n");
   return 0;
 }
+// Prepare-only: tune GEMMs, time arm A/B x untuned/tuned per bucket, verify numerics, write tunableop CSV + arms.json.
+static int tune(const string& dir) {
+  using Clock = std::chrono::steady_clock;
+  auto t0 = Clock::now();
+  auto elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - t0).count(); };
+  const double BUDGET_S = 420;  // tuning wall budget; remaining shapes keep default solutions
+  Model model;
+  model.load(dir, "cuda");
+  c10::InferenceMode im;
+  auto st = gs::getStreamFromPool();
+  gs::setCurrentHIPStream(st);
+  auto* ctx = at::cuda::tunable::getTuningContext();
+  string csv = dir + "/tunableop_results.csv";
+  ctx->SetFilename(csv, false);
+  ctx->WriteFileOnExit(false);
+  ctx->SetMaxTuningDurationMs(20);
+  ctx->SetMaxTuningIterations(30);
+  ctx->SetMaxWarmupDurationMs(5);
+  ctx->SetMaxWarmupIterations(3);
+  ctx->EnableTunableOp(true);
+  ctx->EnableTuning(true);
+  auto lopt = at::TensorOptions().dtype(at::kLong).device(model.dev);
+  int64_t vocab = model.W[0].size(0);
+  std::mt19937 rng(12345);
+  auto make_in = [&](int b, int s) {
+    auto h = at::zeros({2, b, s}, at::kLong);
+    int64_t* p = h.data_ptr<int64_t>();
+    for (int i = 0; i < b; i++) {
+      int len = 2 + (int)(rng() % (unsigned)(s - 1));
+      if (i == 0) len = s;
+      for (int j = 0; j < s; j++) {
+        p[(int64_t)i * s + j] = j < len ? 1 + (int64_t)(rng() % (unsigned)(vocab - 1)) : 0;
+        p[(int64_t)b * s + (int64_t)i * s + j] = j < len;
+      }
+    }
+    return h.to(model.dev);
+  };
+  vector<at::Tensor> inputs;
+  // 1) tune eagerly over every bucket, both arms (small batches / sequences first)
+  for (int bi = 0; bi < NB; bi++)
+    for (int si = 0; si < NS; si++) {
+      int b = BATCH_BUCKETS[bi], s = SEQ_BUCKETS[si];
+      inputs.push_back(make_in(b, s));
+      if (elapsed() > BUDGET_S) ctx->EnableTuning(false);
+      for (int arm = 0; arm < 2; arm++)
+        for (int r = 0; r < 2; r++) model.forward(inputs.back(), arm);
+      GPU(StreamSynchronize)(st.stream());
+    }
+  ctx->EnableTuning(false);
+  bool wrote = false;
+  try { wrote = ctx->WriteFile(csv); } catch (...) {}
+  std::fprintf(stderr, "tune: tuned in %.1fs, results %s\n", elapsed(), wrote ? "written" : "NOT written");
+  // 2) per bucket: capture each variant, check against arm A untuned, time replays
+  GPU(Event_t) e0, e1;
+  GPU(EventCreate)(&e0);
+  GPU(EventCreate)(&e1);
+  const char* names[4] = {"A", "B", "A+tuned", "B+tuned"};
+  string json = "{\n";
+  int cnt[4] = {0, 0, 0, 0};
+  bool first = true;
+  for (int bi = 0; bi < NB; bi++)
+    for (int si = 0; si < NS; si++) {
+      int b = BATCH_BUCKETS[bi], s = SEQ_BUCKETS[si];
+      auto& in = inputs[bi * NS + si];
+      ctx->EnableTunableOp(false);
+      at::Tensor ref = model.forward(in, false).to(at::kCPU);
+      GPU(StreamSynchronize)(st.stream());
+      double ms[4] = {1e30, 1e30, 1e30, 1e30}, dif[4] = {0, 0, 0, 0};
+      bool ok[4] = {true, false, false, false};
+      for (int v = 0; v < 4; v++) {
+        bool armb = v & 1, tuned = v >= 2;
+        if (tuned && !wrote) continue;
+        try {
+          ctx->EnableTunableOp(tuned);
+          for (int i = 0; i < 3; i++) model.forward(in, armb);
+          GPU(StreamSynchronize)(st.stream());
+          at::cuda::CUDAGraph g;
+          g.capture_begin();
+          at::Tensor out = model.forward(in, armb);
+          g.capture_end();
+          GPU(StreamSynchronize)(st.stream());
+          for (int i = 0; i < 10; i++) g.replay();
+          GPU(StreamSynchronize)(st.stream());
+          at::Tensor o = out.to(at::kCPU);
+          double md = (o - ref).abs().max().item<double>();
+          bool am = at::equal(o.argmax(-1), ref.argmax(-1));
+          dif[v] = md;
+          ok[v] = (md <= 2e-3) && am;
+          vector<float> ts;
+          for (int i = 0; i < 50; i++) {
+            GPU(EventRecord)(e0, st.stream());
+            g.replay();
+            GPU(EventRecord)(e1, st.stream());
+            GPU(EventSynchronize)(e1);
+            float t = 0;
+            GPU(EventElapsedTime)(&t, e0, e1);
+            ts.push_back(t);
+          }
+          std::sort(ts.begin(), ts.end());
+          ms[v] = ts[ts.size() / 2];
+        } catch (const std::exception& ex) {
+          std::fprintf(stderr, "tune: variant %s failed for %dx%d: %.200s\n", names[v], b, s, ex.what());
+          ok[v] = false;
+        }
+      }
+      int best = 0;
+      for (int v = 1; v < 4; v++)
+        if (ok[v] && ms[v] < 0.98 * ms[best]) best = v;
+      cnt[best]++;
+      char buf[512];
+      std::snprintf(buf, sizeof buf,
+                    "%s\"%dx%d\": {\"arm\": \"%s\", \"ms\": {\"A\": %.4f, \"B\": %.4f, \"A+tuned\": %.4f, \"B+tuned\": %.4f}, "
+                    "\"maxdiff\": {\"B\": %.2e, \"A+tuned\": %.2e, \"B+tuned\": %.2e}, \"ok\": [%d, %d, %d, %d]}",
+                    first ? "" : ",\n", b, s, names[best], ms[0], ms[1], ms[2], ms[3], dif[1], dif[2], dif[3], (int)ok[0], (int)ok[1],
+                    (int)ok[2], (int)ok[3]);
+      first = false;
+      json += buf;
+      std::fprintf(stderr, "tune: %dx%d -> %s (A %.3f B %.3f A+t %.3f B+t %.3f ms)\n", b, s, names[best], ms[0], ms[1], ms[2], ms[3]);
+    }
+  json += "\n}\n";
+  std::ofstream(dir + "/arms.json") << json;
+  std::printf("arms: A=%d B=%d A+tuned=%d B+tuned=%d (%.0fs)\n", cnt[0], cnt[1], cnt[2], cnt[3], elapsed());
+  return 0;
+}
 static int tokenize_stdin(const string& dir) {
   Tokenizer tok;
   tok.load(dir);
@@ -983,7 +1186,7 @@ static int tokenize_stdin(const string& dir) {
 
 int main(int argc, char** argv) {
   string newsd, model, prepared, device = "cuda";
-  bool st = false, ts = false;
+  bool st = false, ts = false, tn = false;
   for (int i = 1; i < argc; i++) {
     string a = argv[i];
     auto nxt = [&]() { if (i + 1 >= argc) die("missing value for " + a); return string(argv[++i]); };
@@ -993,12 +1196,14 @@ int main(int argc, char** argv) {
     else if (a == "--device") device = nxt();
     else if (a == "--selftest") st = true;
     else if (a == "--tokenize-stdin") ts = true;
+    else if (a == "--tune") tn = true;
     else die("unknown argument " + a);
   }
   if (prepared.empty()) die("--prepared required");
   string dir = prepared + "/native";
   if (ts) return tokenize_stdin(dir);
   if (st) return selftest(dir, device);
+  if (tn) return tune(dir);
   if (newsd.empty()) die("--newsd required");
   App app;
   return app.main_loop(newsd, dir, device);

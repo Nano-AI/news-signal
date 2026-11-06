@@ -146,6 +146,26 @@ def write_manifest(out, enabled: bool, reason: str, model: str = DEFAULT_MODEL) 
     (nd / "manifest.json").write_text(json.dumps({"enabled": enabled, "reason": reason, "model": model}))
 
 
+def tune_native(exe, out) -> str:
+    """GEMM tuning + arm selection on synthetic inputs (prepare only). Never raises; a failure keeps arm A."""
+    nd = native_dir(out)
+    for f in ("arms.json", "tunableop_results.csv"):
+        (nd / f).unlink(missing_ok=True)
+    try:
+        r = subprocess.run([str(exe), "--tune", "--prepared", str(out)], capture_output=True, text=True, timeout=800)
+        print(r.stderr[-6000:], flush=True)
+        if r.returncode:
+            raise RuntimeError(f"exit {r.returncode}: {r.stderr[-300:]}")
+        summary = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "no summary"
+        print(f"native: tune {summary}", flush=True)
+        return "tune " + summary
+    except BaseException as e:  # noqa: BLE001
+        for f in ("arms.json", "tunableop_results.csv"):
+            (nd / f).unlink(missing_ok=True)
+        print(f"native: tune failed, arm A everywhere ({e!r})", file=sys.stderr, flush=True)
+        return "tune failed: arm A everywhere"
+
+
 def prepare_native(train, out, device: str) -> None:
     """Never raises: a failure only disables the native runtime."""
     try:
@@ -164,7 +184,7 @@ def prepare_native(train, out, device: str) -> None:
         if r.returncode:
             write_manifest(out, False, "selftest failed: " + r.stderr[-500:])
             return
-        write_manifest(out, True, f"tokenizer parity {ok}/{n}")
+        write_manifest(out, True, f"tokenizer parity {ok}/{n}; " + tune_native(exe, out))
     except BaseException as e:  # noqa: BLE001 - prepare must still succeed
         print(f"native: disabled ({e!r})", file=sys.stderr, flush=True)
         try:
@@ -186,6 +206,8 @@ def select_binary(prepared, model: str, device: str):
             return None
         if man.get("model") != model:
             export_model(model, prepared)
+            for f in ("arms.json", "tunableop_results.csv"):  # tuned for the other weights/shapes
+                (nd / f).unlink(missing_ok=True)
             ok, n = tokenizer_parity(model, prepared, _SYNTH)
             if ok != n:
                 print(f"serving: native disabled (tokenizer parity {ok}/{n} for {model})", file=sys.stderr, flush=True)

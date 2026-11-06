@@ -88,3 +88,13 @@ def test_end_to_end_cpu(prepared):
             pr = torch.softmax(m(**enc).logits, -1)[0]
         assert s["direction"] == dirs[int(pr.argmax())]
         assert abs(s["confidence"] - float(pr.max())) < 1e-4
+
+
+def test_tune_fallback(tmp_path):
+    """tune_native never raises and leaves no arms/CSV behind when the binary is missing or fails."""
+    (tmp_path / "native").mkdir()
+    (tmp_path / "native" / "arms.json").write_text("garbage")
+    msg = native.tune_native(tmp_path / "native" / "nope", tmp_path)
+    assert "arm A" in msg
+    assert not (tmp_path / "native" / "arms.json").exists()
+    assert not (tmp_path / "native" / "tunableop_results.csv").exists()
