@@ -1,6 +1,7 @@
 """FinBERT headline classifier."""
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 MAX_LENGTH = 64
@@ -35,6 +36,69 @@ def pad_to_bucket(enc, b: int, seq: int, pad_id: int) -> dict[str, torch.Tensor]
     return out
 
 
+class FusedBert:
+    """Pure-torch BERT classifier forward over weights pre-packed from an HF BertForSequenceClassification.
+
+    Per layer: fused QKV addmm, SDPA with additive key mask, out-proj, add+LN, FFN up + GELU, FFN down, add+LN.
+    """
+
+    def __init__(self, model):
+        cfg = model.config
+        if cfg.hidden_act != "gelu":
+            raise ValueError(f"unsupported activation {cfg.hidden_act!r}")
+        self.heads = cfg.num_attention_heads
+        self.hidden = cfg.hidden_size
+        self.eps = cfg.layer_norm_eps
+        self.use_sdpa = True  # set False if SDPA fails; then explicit matmul-softmax-matmul is used
+        bert = model.bert
+        p = next(model.parameters())
+        self.dtype = p.dtype
+        e = bert.embeddings
+        self.word, self.pos, self.tok = (t.weight.detach() for t in
+                                         (e.word_embeddings, e.position_embeddings, e.token_type_embeddings))
+        self.emb_ln = (e.LayerNorm.weight.detach(), e.LayerNorm.bias.detach())
+        self.layers = []
+        for l in bert.encoder.layer:
+            a = l.attention.self
+            qkv_w = torch.cat([a.query.weight, a.key.weight, a.value.weight], 0).detach().contiguous()
+            qkv_b = torch.cat([a.query.bias, a.key.bias, a.value.bias], 0).detach().contiguous()
+            ao, ln1 = l.attention.output.dense, l.attention.output.LayerNorm
+            self.layers.append((
+                qkv_w, qkv_b,
+                ao.weight.detach(), ao.bias.detach(), ln1.weight.detach(), ln1.bias.detach(),
+                l.intermediate.dense.weight.detach(), l.intermediate.dense.bias.detach(),
+                l.output.dense.weight.detach(), l.output.dense.bias.detach(),
+                l.output.LayerNorm.weight.detach(), l.output.LayerNorm.bias.detach()))
+        self.pool = (bert.pooler.dense.weight.detach(), bert.pooler.dense.bias.detach())
+        self.cls = (model.classifier.weight.detach(), model.classifier.bias.detach())
+
+    def _attn(self, q, k, v, mask):
+        if self.use_sdpa:
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        w = torch.softmax(q @ k.transpose(-1, -2) * (q.shape[-1] ** -0.5) + mask, dim=-1)
+        return w @ v
+
+    def forward(self, input_ids, token_type_ids, attention_mask):
+        B, S = input_ids.shape
+        H, nh = self.hidden, self.heads
+        d = H // nh
+        x = self.word[input_ids] + self.pos[:S] + self.tok[token_type_ids]
+        x = F.layer_norm(x, (H,), *self.emb_ln, self.eps)
+        mask = ((1 - attention_mask.to(self.dtype)) * -1e4).view(B, 1, 1, S)
+        for (qw, qb, ow, ob, l1w, l1b, iw, ib, dw, db, l2w, l2b) in self.layers:
+            qkv = torch.addmm(qb, x.view(B * S, H), qw.t()).view(B, S, 3, nh, d)
+            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+            a = self._attn(q, k, v, mask).transpose(1, 2).reshape(B * S, H)
+            h = torch.addmm(ob, a, ow.t()).view(B, S, H)
+            x = F.layer_norm(x + h, (H,), l1w, l1b, self.eps)
+            f = F.gelu(torch.addmm(ib, x.view(B * S, H), iw.t()))
+            h = torch.addmm(db, f, dw.t()).view(B, S, H)
+            x = F.layer_norm(x + h, (H,), l2w, l2b, self.eps)
+        pooled = torch.tanh(torch.addmm(self.pool[1], x[:, 0], self.pool[0].t()))
+        logits = torch.addmm(self.cls[1], pooled, self.cls[0].t())
+        return torch.softmax(logits.float(), dim=-1)
+
+
 class Classifier:
     def __init__(self, model: str, device: str):
         self.device = device
@@ -48,6 +112,7 @@ class Classifier:
         self.model.eval()
         self._graphs: dict[tuple[int, int], tuple] = {}
         self._pool = None
+        self.fused = FusedBert(self.model) if device == "cuda" else None
 
     def predict(self, headline: str) -> tuple[int, float]:
         enc = self.tokenizer(headline, return_tensors="pt", truncation=True, max_length=64)
@@ -61,34 +126,48 @@ class Classifier:
     def _capture(self) -> None:
         self._pool = torch.cuda.graph_pool_handle()
         side = torch.cuda.Stream()
+        keys = ("input_ids", "token_type_ids", "attention_mask")
+        pad = self.tokenizer.pad_token_id
+        # SDPA path probe: fall back to explicit attention if it fails at any bucket.
         for b in BATCH_BUCKETS:
             for seq in SEQ_BUCKETS:
-                bufs = {k: torch.zeros(b, seq, dtype=torch.long, device=self.device)
-                        for k in ("input_ids", "attention_mask", "token_type_ids")}
-                bufs["input_ids"].fill_(self.tokenizer.pad_token_id)
-                bufs["attention_mask"][:, 0] = 1
+                dev = torch.zeros(3, b, seq, dtype=torch.long, device=self.device)
+                dev[0].fill_(pad)
+                dev[2][:, 0] = 1
+                host = torch.zeros(3, b, seq, dtype=torch.long).pin_memory()
+                fwd = lambda: self.fused.forward(dev[0], dev[1], dev[2])
                 with torch.inference_mode():
                     side.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(side):
-                        for _ in range(3):
-                            torch.softmax(self.model(**bufs).logits.float(), -1)
+                        try:
+                            for _ in range(3):
+                                fwd()
+                        except RuntimeError:
+                            self.fused.use_sdpa = False
+                            for _ in range(3):
+                                fwd()
                     torch.cuda.current_stream().wait_stream(side)
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g, pool=self._pool):
-                        out = torch.softmax(self.model(**bufs).logits.float(), -1)
-                self._graphs[(b, seq)] = (g, bufs, out)
+                        out = fwd()
+                out_host = torch.empty(out.shape, dtype=out.dtype).pin_memory()
+                self._graphs[(b, seq)] = (g, dev, host, out, out_host)
         torch.cuda.synchronize()
 
     def _predict_graph(self, enc) -> torch.Tensor:
         n, length = enc["input_ids"].shape
         b, seq = pick_bucket(n, length)
-        g, bufs, out = self._graphs[(b, seq)]
-        padded = pad_to_bucket(enc, b, seq, self.tokenizer.pad_token_id)
-        for k, v in padded.items():
-            bufs[k].copy_(v)
+        g, dev, host, out, out_host = self._graphs[(b, seq)]
+        host[0].fill_(self.tokenizer.pad_token_id)
+        host[1:].zero_()
+        for i, k in enumerate(("input_ids", "token_type_ids", "attention_mask")):
+            host[i, :n, :length] = enc[k]
+        dev.copy_(host, non_blocking=True)
         g.replay()
-        return out[:n].cpu()
+        out_host.copy_(out, non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        return out_host[:n].clone()
 
     def predict_batch(self, headlines: list[str]) -> list[tuple[int, float]]:
         enc = self.tokenizer(headlines, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH)
