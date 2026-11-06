@@ -1,4 +1,4 @@
-"""Plain Hugging Face FinBERT classifier: one headline per call, no batching, no tricks."""
+"""FinBERT headline classifier."""
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer

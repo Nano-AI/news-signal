@@ -13,7 +13,7 @@ MI210. It also works as a plain benchmark you can run by hand.
 An optimizer can cheat a latency benchmark in many ways: skip the model, emit constant signals, peek at future
 stories, memoize the scoring data, or starve the clock that measures it. The design closes those routes:
 
-- **A real baseline.** The starting service is a plain Hugging Face FinBERT classifier, one headline per call.
+- **A real baseline.** The starting service is a Hugging Face FinBERT classifier.
   A faster service must reproduce its signals (see "Quality rule").
 - **Two codebases that share one document.** `infosys/` (evaluator-owned) and `serving/` (the candidate) share
   only `docs/protocol.md`. `tests/test_boundaries.py` checks that neither imports the other.
