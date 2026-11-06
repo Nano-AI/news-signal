@@ -1,5 +1,7 @@
 """FinBERT headline classifier."""
 
+import sys
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -36,6 +38,20 @@ def pad_to_bucket(enc, b: int, seq: int, pad_id: int) -> dict[str, torch.Tensor]
     return out
 
 
+ARMS = ("fused_sdpa", "fused_explicit", "hf_eager")  # candidate graphs per bucket; earlier wins ties
+
+
+def median(xs):
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def select_arm(medians: dict[str, float]) -> str:
+    """Arm with the smallest median replay time; ties go to the earliest arm in ARMS."""
+    return min((a for a in ARMS if a in medians), key=lambda a: medians[a])
+
+
 class FusedBert:
     """Pure-torch BERT classifier forward over weights pre-packed from an HF BertForSequenceClassification.
 
@@ -49,7 +65,6 @@ class FusedBert:
         self.heads = cfg.num_attention_heads
         self.hidden = cfg.hidden_size
         self.eps = cfg.layer_norm_eps
-        self.use_sdpa = True  # set False if SDPA fails; then explicit matmul-softmax-matmul is used
         bert = model.bert
         p = next(model.parameters())
         self.dtype = p.dtype
@@ -72,13 +87,13 @@ class FusedBert:
         self.pool = (bert.pooler.dense.weight.detach(), bert.pooler.dense.bias.detach())
         self.cls = (model.classifier.weight.detach(), model.classifier.bias.detach())
 
-    def _attn(self, q, k, v, mask):
-        if self.use_sdpa:
+    def _attn(self, q, k, v, mask, sdpa=True):
+        if sdpa:
             return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         w = torch.softmax(q @ k.transpose(-1, -2) * (q.shape[-1] ** -0.5) + mask, dim=-1)
         return w @ v
 
-    def forward(self, input_ids, token_type_ids, attention_mask):
+    def forward(self, input_ids, token_type_ids, attention_mask, sdpa=True):
         B, S = input_ids.shape
         H, nh = self.hidden, self.heads
         d = H // nh
@@ -88,7 +103,7 @@ class FusedBert:
         for (qw, qb, ow, ob, l1w, l1b, iw, ib, dw, db, l2w, l2b) in self.layers:
             qkv = torch.addmm(qb, x.view(B * S, H), qw.t()).view(B, S, 3, nh, d)
             q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-            a = self._attn(q, k, v, mask).transpose(1, 2).reshape(B * S, H)
+            a = self._attn(q, k, v, mask, sdpa).transpose(1, 2).reshape(B * S, H)
             h = torch.addmm(ob, a, ow.t()).view(B, S, H)
             x = F.layer_norm(x + h, (H,), l1w, l1b, self.eps)
             f = F.gelu(torch.addmm(ib, x.view(B * S, H), iw.t()))
@@ -123,41 +138,78 @@ class Classifier:
         idx = int(torch.argmax(probs))
         return label_direction(self.model.config.id2label[idx]), float(probs[idx])
 
+    def _arm_fwd(self, arm, dev):
+        if arm == "hf_eager":
+            return lambda: torch.softmax(
+                self.model(input_ids=dev[0], token_type_ids=dev[1], attention_mask=dev[2]).logits.float(), -1)
+        sdpa = arm == "fused_sdpa"
+        return lambda: self.fused.forward(dev[0], dev[1], dev[2], sdpa)
+
+    def _capture_arm(self, arm, dev, side):
+        fwd = self._arm_fwd(arm, dev)
+        with torch.inference_mode():
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    fwd()
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self._pool):
+                out = fwd()
+        return g, out
+
+    @staticmethod
+    def _time_replay(g, warm=5, n=15) -> float:
+        for _ in range(warm):
+            g.replay()
+        times = []
+        for _ in range(n):
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            g.replay()
+            e1.record()
+            e1.synchronize()
+            times.append(e0.elapsed_time(e1))
+        return median(times)
+
     def _capture(self) -> None:
         self._pool = torch.cuda.graph_pool_handle()
         side = torch.cuda.Stream()
-        keys = ("input_ids", "token_type_ids", "attention_mask")
         pad = self.tokenizer.pad_token_id
-        # Decide the attention path once, before any bucket is captured: SDPA if it runs, else explicit
-        # matmul-softmax-matmul. All buckets then capture the same path (self.fused.use_sdpa records it).
-        try:
+        arms = list(ARMS)
+        try:  # SDPA probe: if it raises, that arm is unavailable
             with torch.inference_mode():
                 z = torch.zeros(1, 16, dtype=torch.long, device=self.device)
-                self.fused.forward(z, z, torch.ones_like(z))
+                self.fused.forward(z, z, torch.ones_like(z), True)
                 torch.cuda.synchronize()
-            self.fused.use_sdpa = True
         except RuntimeError:
-            self.fused.use_sdpa = False
+            arms.remove("fused_sdpa")
+        chosen = {}
         for b in BATCH_BUCKETS:
             for seq in SEQ_BUCKETS:
                 dev = torch.zeros(3, b, seq, dtype=torch.long, device=self.device)
                 dev[0].fill_(pad)
                 dev[2][:, 0] = 1
                 host = torch.zeros(3, b, seq, dtype=torch.long).pin_memory()
-                fwd = lambda: self.fused.forward(dev[0], dev[1], dev[2])
-                with torch.inference_mode():
-                    side.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(side):
-                        for _ in range(3):
-                            fwd()
-                    torch.cuda.current_stream().wait_stream(side)
-                    torch.cuda.synchronize()
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g, pool=self._pool):
-                        out = fwd()
+                cands, meds = {}, {}
+                for arm in arms:
+                    try:
+                        g, out = self._capture_arm(arm, dev, side)
+                    except RuntimeError:
+                        continue
+                    cands[arm] = (g, out)
+                    meds[arm] = self._time_replay(g)
+                best = select_arm(meds)
+                g, out = cands[best]
+                del cands
                 out_host = torch.empty(out.shape, dtype=out.dtype).pin_memory()
                 self._graphs[(b, seq)] = (g, dev, host, out, out_host)
+                chosen[(b, seq)] = best
         torch.cuda.synchronize()
+        short = {"fused_sdpa": "S", "fused_explicit": "E", "hf_eager": "H"}
+        print("graph arms (S=sdpa E=explicit H=hf): " +
+              " ".join(f"{b}x{s}:{short[a]}" for (b, s), a in chosen.items()), file=sys.stderr, flush=True)
 
     def _predict_graph(self, enc) -> torch.Tensor:
         n, length = enc["input_ids"].shape

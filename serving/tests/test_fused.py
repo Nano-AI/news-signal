@@ -3,7 +3,7 @@ import inspect
 import torch
 from transformers import BertConfig, BertForSequenceClassification
 
-from serving.model import Classifier, FusedBert
+from serving.model import ARMS, Classifier, FusedBert, median, select_arm
 
 
 def _model():
@@ -31,9 +31,7 @@ def test_fused_matches_hf():
     with torch.no_grad():
         ref = torch.softmax(m(input_ids=ids, token_type_ids=tt, attention_mask=mask).logits, -1)
         got = fb.forward(ids, tt, mask)
-        got2 = FusedBert(m)
-        got2.use_sdpa = False
-        got2 = got2.forward(ids, tt, mask)
+        got2 = fb.forward(ids, tt, mask, sdpa=False)
     assert (ref - got).abs().max() < 1e-4 and (ref - got2).abs().max() < 1e-4
     assert (ref.argmax(-1) == got.argmax(-1)).all()
 
@@ -53,4 +51,17 @@ def test_padding_rows_do_not_change_output():
 
 def test_cuda_capture_uses_fused_forward():
     src = inspect.getsource(Classifier._capture)
-    assert "self.fused.forward" in src and "self.model(" not in src
+    assert "_capture_arm" in src and "select_arm" in src and "use_sdpa" not in src
+    assert "use_sdpa" not in inspect.getsource(FusedBert)
+
+
+def test_select_arm_min_median_and_ties():
+    assert select_arm({"fused_sdpa": 3.0, "fused_explicit": 2.0, "hf_eager": 2.5}) == "fused_explicit"
+    assert select_arm({"fused_sdpa": 2.0, "fused_explicit": 2.0, "hf_eager": 2.0}) == "fused_sdpa"
+    assert select_arm({"fused_explicit": 2.0, "hf_eager": 2.0}) == "fused_explicit"
+    assert select_arm({"hf_eager": 1.0}) == "hf_eager"
+    assert set(ARMS) == {"fused_sdpa", "fused_explicit", "hf_eager"}
+
+
+def test_median():
+    assert median([3, 1, 2]) == 2 and median([1, 2, 3, 10]) == 2.5
