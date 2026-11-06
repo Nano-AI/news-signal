@@ -1,6 +1,8 @@
 """FinBERT headline classifier."""
 
+import ctypes
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -39,7 +41,18 @@ def pad_to_bucket(enc, b: int, seq: int, pad_id: int) -> dict[str, torch.Tensor]
     return out
 
 
-ARMS = ("fused_sdpa", "fused_explicit", "hf_eager")  # candidate graphs per bucket; earlier wins ties
+ARMS = ("fused_hip", "fused_sdpa", "fused_explicit", "hf_eager")  # candidate graphs per bucket; earlier wins ties
+
+
+def load_kernels(prepared):
+    """ctypes handle on prepared/bert_fused.so, or None if absent or unloadable."""
+    path = Path(prepared) / "bert_fused.so" if prepared else None
+    if path is None or not path.exists():
+        return None
+    try:
+        return ctypes.CDLL(str(path))
+    except OSError:
+        return None
 
 
 def median(xs):
@@ -94,6 +107,31 @@ class FusedBert:
         w = torch.softmax(q @ k.transpose(-1, -2) * (q.shape[-1] ** -0.5) + mask, dim=-1)
         return w @ v
 
+    def forward_hip(self, lib, input_ids, token_type_ids, attention_mask):
+        """forward() structure with HIP kernels for emb+LN, attention and add+LN."""
+        B, S = input_ids.shape
+        H, nh = self.hidden, self.heads
+        if H // nh != 64 or S > 64 or H > 1024 or self.dtype != torch.float16:
+            raise RuntimeError("fused_hip unsupported for this shape")
+        st = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+        P = lambda t: ctypes.c_void_p(t.data_ptr())
+        eps, scale = ctypes.c_float(self.eps), ctypes.c_float((H // nh) ** -0.5)
+        x = torch.empty(B * S, H, dtype=self.dtype, device=input_ids.device)
+        lib.launch_emb_ln(P(input_ids), P(token_type_ids), P(self.word), P(self.pos), P(self.tok),
+                          P(self.emb_ln[0]), P(self.emb_ln[1]), P(x), B * S, S, H, eps, st)
+        for (qw, qb, ow, ob, l1w, l1b, iw, ib, dw, db, l2w, l2b) in self.layers:
+            qkv = torch.addmm(qb, x, qw.t())
+            a = torch.empty(B * S, H, dtype=self.dtype, device=x.device)
+            lib.launch_attn(P(qkv), P(attention_mask), P(a), B, S, nh, scale, st)
+            h = torch.addmm(ob, a, ow.t())
+            lib.launch_add_ln(P(x), P(h), P(l1w), P(l1b), P(x), B * S, H, eps, st)
+            f = F.gelu(torch.addmm(ib, x, iw.t()))
+            h = torch.addmm(db, f, dw.t())
+            lib.launch_add_ln(P(x), P(h), P(l2w), P(l2b), P(x), B * S, H, eps, st)
+        pooled = torch.tanh(torch.addmm(self.pool[1], x.view(B, S, H)[:, 0], self.pool[0].t()))
+        logits = torch.addmm(self.cls[1], pooled, self.cls[0].t())
+        return torch.softmax(logits.float(), dim=-1)
+
     def forward(self, input_ids, token_type_ids, attention_mask, sdpa=True):
         B, S = input_ids.shape
         H, nh = self.hidden, self.heads
@@ -116,8 +154,9 @@ class FusedBert:
 
 
 class Classifier:
-    def __init__(self, model: str, device: str):
+    def __init__(self, model: str, device: str, prepared=None):
         self.device = device
+        self.lib = load_kernels(prepared) if device == "cuda" else None
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if device == "cuda":
             self.model = AutoModelForSequenceClassification.from_pretrained(
@@ -146,6 +185,8 @@ class Classifier:
         if arm == "hf_eager":
             return lambda: torch.softmax(
                 self.model(input_ids=dev[0], token_type_ids=dev[1], attention_mask=dev[2]).logits.float(), -1)
+        if arm == "fused_hip":
+            return lambda: self.fused.forward_hip(self.lib, dev[0], dev[1], dev[2])
         sdpa = arm == "fused_sdpa"
         return lambda: self.fused.forward(dev[0], dev[1], dev[2], sdpa)
 
@@ -182,6 +223,8 @@ class Classifier:
         side = torch.cuda.Stream()
         pad = self.tokenizer.pad_token_id
         arms = list(ARMS)
+        if self.lib is None:
+            arms.remove("fused_hip")
         try:  # SDPA probe: if it raises, that arm is unavailable
             with torch.inference_mode():
                 z = torch.zeros(1, 16, dtype=torch.long, device=self.device)
@@ -211,8 +254,8 @@ class Classifier:
                 self._graphs[(b, seq)] = (g, dev, host, out, out_host)
                 chosen[(b, seq)] = best
         torch.cuda.synchronize()
-        short = {"fused_sdpa": "S", "fused_explicit": "E", "hf_eager": "H"}
-        print("graph arms (S=sdpa E=explicit H=hf): " +
+        short = {"fused_hip": "K", "fused_sdpa": "S", "fused_explicit": "E", "hf_eager": "H"}
+        print("graph arms (K=hip S=sdpa E=explicit H=hf): " +
               " ".join(f"{b}x{s}:{short[a]}" for (b, s), a in chosen.items()), file=sys.stderr, flush=True)
 
     def tokenize(self, headline: str) -> list[int]:

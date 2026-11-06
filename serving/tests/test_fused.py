@@ -60,7 +60,7 @@ def test_select_arm_min_median_and_ties():
     assert select_arm({"fused_sdpa": 2.0, "fused_explicit": 2.0, "hf_eager": 2.0}) == "fused_sdpa"
     assert select_arm({"fused_explicit": 2.0, "hf_eager": 2.0}) == "fused_explicit"
     assert select_arm({"hf_eager": 1.0}) == "hf_eager"
-    assert set(ARMS) == {"fused_sdpa", "fused_explicit", "hf_eager"}
+    assert set(ARMS) == {"fused_hip", "fused_sdpa", "fused_explicit", "hf_eager"}
 
 
 def test_median():

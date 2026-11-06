@@ -10,9 +10,9 @@ def main() -> None:
     p.add_argument("--newsd", required=True)
     p.add_argument("--model", required=True)
     p.add_argument("--device", required=True, choices=["cuda", "cpu"])
-    p.add_argument("--prepared", required=True)  # unused: the baseline prepares nothing
+    p.add_argument("--prepared", required=True)  # holds bert_fused.so when built
     a = p.parse_args()
-    clf = Classifier(a.model, a.device)
+    clf = Classifier(a.model, a.device, a.prepared)
     clf.warmup()
     asyncio.run(run(a.newsd, clf.predict_ids, clf.tokenize))
 
