@@ -21,6 +21,7 @@ def story(feed, seq, sid, tickers, headline):
 class FakeNewsd:
     def __init__(self):
         self.events, self.signals, self.ws_open = [], [], 0
+        self.polls, self.post_sizes = [], []
         self.ready, self.both_ws = asyncio.Event(), asyncio.Event()
         self.app = web.Application()
         self.app.add_routes([
@@ -52,6 +53,9 @@ class FakeNewsd:
 
     async def poll(self, req):
         after = int(req.query["after"])
+        self.polls.append(dict(req.query))
+        if not self.ready.is_set():
+            await asyncio.sleep(0.02)  # stand-in for the server-side hold
         msgs = [story("poll", i + 1, *s) for i, s in enumerate(STORIES) if i + 1 > after] if self.ready.is_set() else []
         return web.json_response({"messages": msgs, "next": after + len(msgs), "end": bool(msgs)})
 
@@ -63,9 +67,9 @@ class FakeNewsd:
 
     async def on_signals(self, req):
         body = await req.json()
-        assert len(body["signals"]) == 1
+        self.post_sizes.append(sorted(s["ticker"] for s in body["signals"]))
         self.signals += body["signals"]
-        return web.json_response({"accepted": 1, "rejected": []})
+        return web.json_response({"accepted": len(body["signals"]), "rejected": []})
 
 
 async def _scenario():
@@ -87,6 +91,8 @@ def test_service_end_to_end():
     assert fake.events == ["ws", "ws", "ready"]
     pairs = sorted((s["story_id"], s["ticker"]) for s in fake.signals)
     assert pairs == [("s1", "AAA"), ("s1", "BBB"), ("s2", "CCC"), ("s3", "DDD")]
+    assert sorted(fake.post_sizes) == [["AAA", "BBB"], ["CCC"], ["DDD"]]  # one POST per story
+    assert fake.polls and all(int(q["wait_ms"]) > 0 and 1 <= int(q["limit"]) <= 500 for q in fake.polls)
     assert {s["story_id"]: (s["direction"], s["confidence"]) for s in fake.signals}["s2"] == (-1, 0.8)
 
 
@@ -144,4 +150,4 @@ def test_failures_raise(mode, exc, msg):
 
 
 def test_409_stops_cleanly():
-    assert asyncio.run(_failing("409", lambda h: FAKE[h])).posts == 1
+    assert asyncio.run(_failing("409", lambda h: FAKE[h])).posts >= 1

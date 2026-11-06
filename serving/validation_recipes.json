@@ -1,0 +1,1 @@
+{"version":1,"recipes":[{"name":"service-tests","command":"python3 -m pytest -q serving/tests/test_service.py","input_paths":["serving/service.py","serving/tests/test_service.py"],"purpose":"Batched POST per story, long-poll params, 409 and failure paths."}]}

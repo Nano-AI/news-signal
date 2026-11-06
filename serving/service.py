@@ -34,7 +34,7 @@ async def _ws_feed(session, base: str, feed: dict, queue: asyncio.Queue, opened:
 async def _poll_feed(session, base: str, feed: dict, queue: asyncio.Queue):
     after = 0
     while True:
-        async with session.get(base + feed["path"], params={"after": after, "wait_ms": 0}) as r:
+        async with session.get(base + feed["path"], params={"after": after, "wait_ms": 1000, "limit": 500}) as r:
             r.raise_for_status()
             body = await r.json()
         for msg in body["messages"]:
@@ -42,30 +42,53 @@ async def _poll_feed(session, base: str, feed: dict, queue: asyncio.Queue):
         after = body["next"]
         if body["end"]:
             break
-        if not body["messages"]:
-            await asyncio.sleep(0.1)
     await queue.put(None)
+
+
+async def _post(session, base: str, story_id: str, tickers: list, direction: int, confidence: float) -> bool:
+    """POST one story's signals in a single batch; True if newsd answered 409 (run finished)."""
+    sigs = [build_signal(story_id, t, direction, confidence) for t in tickers]
+    async with session.post(base + "/signals", json={"signals": sigs}) as r:
+        if r.status == 409:
+            return True
+        if r.status != 200:
+            raise RuntimeError(f"POST /signals -> {r.status}: {await r.text()}")
+    return False
 
 
 async def _worker(session, base: str, queue: asyncio.Queue, n_feeds: int, classify):
     seen: set[str] = set()  # ponytail: naive dedup, grows without bound
+    pending: set[asyncio.Task] = set()
+    stopped = False
+
+    def reap(done):
+        nonlocal stopped
+        for t in done:
+            pending.discard(t)
+            if t.result():
+                stopped = True
+
     ended = 0
-    while ended < n_feeds:
-        story = await queue.get()
-        if story is None:
-            ended += 1
-            continue
-        if story["story_id"] in seen:
-            continue
-        seen.add(story["story_id"])
-        direction, confidence = await asyncio.to_thread(classify, story["headline"])
-        for ticker in story["tickers"]:
-            sig = build_signal(story["story_id"], ticker, direction, confidence)
-            async with session.post(base + "/signals", json={"signals": [sig]}) as r:
-                if r.status == 409:  # run finished: nothing left to score
-                    return
-                if r.status != 200:
-                    raise RuntimeError(f"POST /signals -> {r.status}: {await r.text()}")
+    try:
+        while ended < n_feeds and not stopped:
+            story = await queue.get()
+            if story is None:
+                ended += 1
+                continue
+            if story["story_id"] in seen:
+                continue
+            seen.add(story["story_id"])
+            direction, confidence = await asyncio.to_thread(classify, story["headline"])
+            pending.add(asyncio.create_task(
+                _post(session, base, story["story_id"], story["tickers"], direction, confidence)))
+            reap({t for t in pending if t.done()})  # surface errors early
+        if pending:
+            done, _ = await asyncio.wait(pending)
+            reap(done)
+    finally:
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def run(newsd_url: str, classify: Callable[[str], tuple[int, float]]) -> None:
