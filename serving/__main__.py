@@ -14,7 +14,7 @@ def main() -> None:
     a = p.parse_args()
     clf = Classifier(a.model, a.device)
     clf.warmup()
-    asyncio.run(run(a.newsd, clf.predict_ids, clf.tokenize))
+    asyncio.run(run(a.newsd, clf.predict_ids, clf.tokenize, clf.num_lanes))
 
 
 if __name__ == "__main__":

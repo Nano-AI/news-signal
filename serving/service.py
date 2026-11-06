@@ -1,6 +1,7 @@
 """Baseline service: subscribe to every feed, classify each new story, post one signal per ticker."""
 
 import asyncio
+import functools
 import json
 import queue
 import sys
@@ -51,8 +52,8 @@ async def _poll_feed(session, base: str, feed: dict, on_story):
             return
 
 
-def _infer_loop(inq: queue.Queue, classify_batch, loop, on_batch, finished: asyncio.Future):
-    """The only thread that touches the model: classify whatever is queued, as soon as it is free."""
+def _infer_loop(inq: queue.Queue, classify_batch, loop, on_batch, on_exit):
+    """One lane's thread: classify whatever is queued, as soon as the lane is free."""
     try:
         done = False
         while not done:
@@ -71,9 +72,9 @@ def _infer_loop(inq: queue.Queue, classify_batch, loop, on_batch, finished: asyn
             results = classify_batch([ids for _, ids in batch])
             loop.call_soon_threadsafe(on_batch, [s for s, _ in batch], results)
     except BaseException as e:
-        loop.call_soon_threadsafe(finished.set_exception, e)
+        loop.call_soon_threadsafe(on_exit, e)
         return
-    loop.call_soon_threadsafe(finished.set_result, None)
+    loop.call_soon_threadsafe(on_exit, None)
 
 
 _JSON = {"Content-Type": "application/json"}
@@ -93,8 +94,10 @@ async def _post(session, base: str, body: bytes) -> bool:
 
 
 async def run(newsd_url: str, classify_batch: Callable[[list], list[tuple[int, float]]],
-              tokenize: Callable[[str], object] = lambda h: h) -> None:
-    """tokenize runs at arrival in the event loop; classify_batch receives its outputs."""
+              tokenize: Callable[[str], object] = lambda h: h, lanes: int = 1) -> None:
+    """tokenize runs at arrival in the event loop; classify_batch receives its outputs.
+
+    With lanes > 1, one inference thread per lane shares the queue and calls classify_batch(ids, lane)."""
     sys.setswitchinterval(0.0002)
     base = newsd_url.rstrip("/")
     loop = asyncio.get_running_loop()
@@ -133,9 +136,27 @@ async def run(newsd_url: str, classify_batch: Callable[[list], list[tuple[int, f
             task.add_done_callback(on_post_done)
 
     finished: asyncio.Future = loop.create_future()
-    thread = threading.Thread(
-        target=_infer_loop, args=(inq, classify_batch, loop, on_batch, finished), daemon=True
-    )
+    live = lanes
+
+    def on_exit(exc: BaseException | None) -> None:
+        nonlocal live
+        live -= 1
+        if finished.done():
+            return
+        if exc is not None:
+            finished.set_exception(exc)
+        elif live == 0:
+            finished.set_result(None)
+
+    threads = [
+        threading.Thread(
+            target=_infer_loop,
+            args=(inq, classify_batch if lanes == 1 else functools.partial(classify_batch, lane=i),
+                  loop, on_batch, on_exit),
+            daemon=True,
+        )
+        for i in range(lanes)
+    ]
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as session:
         async with session.get(base + "/feeds") as r:
             r.raise_for_status()
@@ -148,7 +169,8 @@ async def run(newsd_url: str, classify_batch: Callable[[list], list[tuple[int, f
                 tasks.append(asyncio.create_task(_ws_feed(session, base, feed, on_story, ev)))
             else:
                 tasks.append(asyncio.create_task(_poll_feed(session, base, feed, on_story)))
-        thread.start()
+        for t in threads:
+            t.start()
         waiter = asyncio.gather(*(ev.wait() for ev in opened))
         stop_wait = asyncio.create_task(stopped.wait())
         try:
@@ -164,7 +186,8 @@ async def run(newsd_url: str, classify_batch: Callable[[list], list[tuple[int, f
                     ready_sent = True
                 if not feeds_done and all(t.done() for t in tasks):
                     feeds_done = True
-                    inq.put(None)  # every feed ended: let the inference thread finish
+                    for _ in threads:
+                        inq.put(None)  # every feed ended: let each inference thread finish
                 if feeds_done and finished.done():
                     finished.result()
                     if not posts:
@@ -180,7 +203,8 @@ async def run(newsd_url: str, classify_batch: Callable[[list], list[tuple[int, f
             print(f"serving: {e!r}", file=sys.stderr)
             raise
         finally:
-            inq.put(None)
+            for _ in threads:
+                inq.put(None)
             waiter.cancel()
             stop_wait.cancel()
             for t in [*tasks, *posts]:

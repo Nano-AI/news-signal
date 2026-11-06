@@ -144,3 +144,55 @@ def test_failures_raise(mode, exc, msg):
 
 def test_409_stops_cleanly():
     assert asyncio.run(_failing("409", lambda hs: [FAKE[h] for h in hs])).posts == 1
+
+
+# ---- dual lanes -------------------------------------------------------------------------------
+def test_two_lanes_overlap_exactly_once_and_finish():
+    import threading
+    import time
+
+    from serving.service import _infer_loop
+    import queue
+
+    inq: queue.Queue = queue.Queue()
+    spans, seen, lock = [], [], threading.Lock()
+
+    def classify(ids, lane):
+        t0 = time.monotonic()
+        time.sleep(0.2)
+        with lock:
+            spans.append((lane, t0, time.monotonic()))
+            seen.extend(ids)
+        return [(0, 0.5)] * len(ids)
+
+    async def go():
+        import functools
+        loop = asyncio.get_running_loop()
+        finished = loop.create_future()
+        live, got = 2, []
+
+        def on_exit(exc):
+            nonlocal live
+            live -= 1
+            if exc is not None and not finished.done():
+                finished.set_exception(exc)
+            elif live == 0 and not finished.done():
+                finished.set_result(None)
+
+        for i in range(2):
+            threading.Thread(target=_infer_loop, daemon=True, args=(
+                inq, functools.partial(classify, lane=i), loop,
+                lambda stories, res: got.extend(stories), on_exit)).start()
+        inq.put(("a", 1))
+        await asyncio.sleep(0.05)  # lane 0 is busy; a new arrival must start on the idle lane
+        inq.put(("b", 2))
+        inq.put(None)
+        inq.put(None)
+        await asyncio.wait_for(finished, timeout=5)
+        return got
+
+    got = asyncio.run(go())
+    assert sorted(got) == ["a", "b"] and sorted(seen) == [1, 2]
+    (_, s0, e0), (_, s1, e1) = sorted(spans, key=lambda x: x[1])
+    assert s1 < e0, "second batch must start before the first finishes"
+    assert {l for l, _, _ in spans} == {0, 1}

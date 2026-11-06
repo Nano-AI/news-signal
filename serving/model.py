@@ -115,6 +115,25 @@ class FusedBert:
         return torch.softmax(logits.float(), dim=-1)
 
 
+LANES = 2  # concurrent graph-replay lanes on cuda; fixed, independent of load
+
+
+class Lane:
+    """One replay lane: its own stream, private graph pool, and static buffers/graphs per bucket."""
+
+    def __init__(self, stream, pool):
+        self.stream = stream
+        self.pool = pool
+        self.graphs: dict[tuple[int, int], tuple] = {}
+        self._np: dict = {}
+
+    def host_np(self, key, host):
+        v = self._np.get(key)
+        if v is None:
+            v = self._np[key] = host.numpy()
+        return v
+
+
 class Classifier:
     def __init__(self, model: str, device: str):
         self.device = device
@@ -126,10 +145,9 @@ class Classifier:
         else:
             self.model = AutoModelForSequenceClassification.from_pretrained(model).to(device)
         self.model.eval()
-        self._graphs: dict[tuple[int, int], tuple] = {}
-        self._pool = None
+        self.num_lanes = LANES if device == "cuda" else 1
+        self._lanes: list[Lane] = []
         self.fused = FusedBert(self.model) if device == "cuda" else None
-        self._np: dict = {}
         self._pad_id = self.tokenizer.pad_token_id
         self._id_dir = {int(i): label_direction(l) for i, l in self.model.config.id2label.items()}
 
@@ -149,7 +167,7 @@ class Classifier:
         sdpa = arm == "fused_sdpa"
         return lambda: self.fused.forward(dev[0], dev[1], dev[2], sdpa)
 
-    def _capture_arm(self, arm, dev, side):
+    def _capture_arm(self, arm, dev, side, pool):
         fwd = self._arm_fwd(arm, dev)
         with torch.inference_mode():
             side.wait_stream(torch.cuda.current_stream())
@@ -159,7 +177,7 @@ class Classifier:
             torch.cuda.current_stream().wait_stream(side)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=self._pool):
+            with torch.cuda.graph(g, pool=pool):
                 out = fwd()
         return g, out
 
@@ -178,7 +196,7 @@ class Classifier:
         return median(times)
 
     def _capture(self) -> None:
-        self._pool = torch.cuda.graph_pool_handle()
+        """Lane 0 times the arms per bucket; the other lanes capture the arm it selected."""
         side = torch.cuda.Stream()
         pad = self.tokenizer.pad_token_id
         arms = list(ARMS)
@@ -189,27 +207,32 @@ class Classifier:
                 torch.cuda.synchronize()
         except RuntimeError:
             arms.remove("fused_sdpa")
+        self._lanes = [Lane(torch.cuda.Stream(), torch.cuda.graph_pool_handle()) for _ in range(self.num_lanes)]
         chosen = {}
         for b in BATCH_BUCKETS:
             for seq in SEQ_BUCKETS:
-                dev = torch.zeros(3, b, seq, dtype=torch.long, device=self.device)
-                dev[0].fill_(pad)
-                dev[2][:, 0] = 1
-                host = torch.zeros(3, b, seq, dtype=torch.long).pin_memory()
-                cands, meds = {}, {}
-                for arm in arms:
-                    try:
-                        g, out = self._capture_arm(arm, dev, side)
-                    except RuntimeError:
-                        continue
-                    cands[arm] = (g, out)
-                    meds[arm] = self._time_replay(g)
-                best = select_arm(meds)
-                g, out = cands[best]
-                del cands
-                out_host = torch.empty(out.shape, dtype=out.dtype).pin_memory()
-                self._graphs[(b, seq)] = (g, dev, host, out, out_host)
-                chosen[(b, seq)] = best
+                for lane in self._lanes:
+                    dev = torch.zeros(3, b, seq, dtype=torch.long, device=self.device)
+                    dev[0].fill_(pad)
+                    dev[2][:, 0] = 1
+                    host = torch.zeros(3, b, seq, dtype=torch.long).pin_memory()
+                    if lane is self._lanes[0]:
+                        cands, meds = {}, {}
+                        for arm in arms:
+                            try:
+                                g, out = self._capture_arm(arm, dev, side, lane.pool)
+                            except RuntimeError:
+                                continue
+                            cands[arm] = (g, out)
+                            meds[arm] = self._time_replay(g)
+                        best = select_arm(meds)
+                        g, out = cands[best]
+                        del cands
+                        chosen[(b, seq)] = best
+                    else:
+                        g, out = self._capture_arm(chosen[(b, seq)], dev, side, lane.pool)
+                    out_host = torch.empty(out.shape, dtype=out.dtype).pin_memory()
+                    lane.graphs[(b, seq)] = (g, dev, host, out, out_host)
         torch.cuda.synchronize()
         short = {"fused_sdpa": "S", "fused_explicit": "E", "hf_eager": "H"}
         print("graph arms (S=sdpa E=explicit H=hf): " +
@@ -219,17 +242,12 @@ class Classifier:
         """Token ids (with special tokens, truncated, unpadded) for one headline."""
         return self.tokenizer(headline, truncation=True, max_length=MAX_LENGTH)["input_ids"]
 
-    def _host_np(self, key, host):
-        v = self._np.get(key)
-        if v is None:
-            v = self._np[key] = host.numpy()
-        return v
-
-    def _predict_graph_ids(self, ids_list) -> list[tuple[int, float]]:
+    def _predict_graph_ids(self, ids_list, lane_idx) -> list[tuple[int, float]]:
+        lane = self._lanes[lane_idx]
         n = len(ids_list)
         b, seq = pick_bucket(n, max(map(len, ids_list)))
-        g, dev, host, out, out_host = self._graphs[(b, seq)]
-        h = self._host_np((b, seq), host)
+        g, dev, host, out, out_host = lane.graphs[(b, seq)]
+        h = lane.host_np((b, seq), host)
         h[0].fill(self._pad_id)
         h[1:] = 0
         ids, mask = h[0], h[2]
@@ -237,19 +255,20 @@ class Classifier:
             m = len(x)
             ids[i, :m] = x
             mask[i, :m] = 1
-        dev.copy_(host, non_blocking=True)
-        g.replay()
-        out_host.copy_(out, non_blocking=True)
-        torch.cuda.current_stream().synchronize()
-        probs = self._host_np(("out", b, seq), out_host)[:n]
+        with torch.cuda.stream(lane.stream):
+            dev.copy_(host, non_blocking=True)
+            g.replay()
+            out_host.copy_(out, non_blocking=True)
+        lane.stream.synchronize()
+        probs = lane.host_np(("out", b, seq), out_host)[:n]
         idx = probs.argmax(axis=-1)
         conf = probs[np.arange(n), idx].tolist()
         dirs = self._id_dir
         return [(dirs[i], c) for i, c in zip(idx.tolist(), conf)]
 
-    def predict_ids(self, ids_list: list[list[int]]) -> list[tuple[int, float]]:
+    def predict_ids(self, ids_list: list[list[int]], lane: int = 0) -> list[tuple[int, float]]:
         if self.device == "cuda":
-            return self._predict_graph_ids(ids_list)
+            return self._predict_graph_ids(ids_list, lane)
         n, length = len(ids_list), max(map(len, ids_list))
         ids = torch.full((n, length), self._pad_id, dtype=torch.long)
         mask = torch.zeros(n, length, dtype=torch.long)
