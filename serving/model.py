@@ -28,3 +28,18 @@ class Classifier:
         probs = torch.softmax(logits, dim=-1)[0]
         idx = int(torch.argmax(probs))
         return label_direction(self.model.config.id2label[idx]), float(probs[idx])
+
+    def predict_batch(self, headlines: list[str]) -> list[tuple[int, float]]:
+        enc = self.tokenizer(headlines, return_tensors="pt", padding=True, truncation=True, max_length=64)
+        enc = {k: v.to(self.device) for k, v in enc.items()}
+        with torch.inference_mode():
+            probs = torch.softmax(self.model(**enc).logits, dim=-1)
+        conf, idx = probs.max(dim=-1)
+        id2label = self.model.config.id2label
+        return [(label_direction(id2label[i]), c) for i, c in zip(idx.tolist(), conf.tolist())]
+
+    def warmup(self) -> None:
+        words = ("stocks rally as earnings beat expectations and guidance rises " * 20).split()
+        for n in (1, 2, 8, 32, 64):
+            for length in (4, 30, 100):
+                self.predict_batch([" ".join(words[:length])] * n)

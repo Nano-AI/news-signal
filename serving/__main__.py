@@ -12,7 +12,9 @@ def main() -> None:
     p.add_argument("--device", required=True, choices=["cuda", "cpu"])
     p.add_argument("--prepared", required=True)  # unused: the baseline prepares nothing
     a = p.parse_args()
-    asyncio.run(run(a.newsd, Classifier(a.model, a.device).predict))
+    clf = Classifier(a.model, a.device)
+    clf.warmup()
+    asyncio.run(run(a.newsd, clf.predict_batch))
 
 
 if __name__ == "__main__":

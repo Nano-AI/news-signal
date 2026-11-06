@@ -63,9 +63,8 @@ class FakeNewsd:
 
     async def on_signals(self, req):
         body = await req.json()
-        assert len(body["signals"]) == 1
         self.signals += body["signals"]
-        return web.json_response({"accepted": 1, "rejected": []})
+        return web.json_response({"accepted": len(body["signals"]), "rejected": []})
 
 
 async def _scenario():
@@ -76,7 +75,7 @@ async def _scenario():
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
     try:
-        await asyncio.wait_for(run(f"http://127.0.0.1:{port}", lambda h: FAKE[h]), timeout=10)
+        await asyncio.wait_for(run(f"http://127.0.0.1:{port}", lambda hs: [FAKE[h] for h in hs]), timeout=10)
     finally:
         await runner.cleanup()
     return fake
@@ -130,7 +129,7 @@ async def _failing(mode, classify):
     return fake
 
 
-def _boom(h):
+def _boom(hs):
     raise KeyError("boom")
 
 
@@ -140,8 +139,8 @@ def _boom(h):
 )
 def test_failures_raise(mode, exc, msg):
     with pytest.raises(exc, match=msg):
-        asyncio.run(_failing(mode, _boom if mode == "ok" else (lambda h: FAKE[h])))
+        asyncio.run(_failing(mode, _boom if mode == "ok" else (lambda hs: [FAKE[h] for h in hs])))
 
 
 def test_409_stops_cleanly():
-    assert asyncio.run(_failing("409", lambda h: FAKE[h])).posts == 1
+    assert asyncio.run(_failing("409", lambda hs: [FAKE[h] for h in hs])).posts == 1

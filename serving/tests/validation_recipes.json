@@ -1,0 +1,1 @@
+{"version":1,"recipes":[{"name":"unit-tests","command":"uv run --offline pytest -q serving/tests","input_paths":["serving/service.py","serving/model.py","serving/tests/test_batch.py","serving/tests/test_service.py","pyproject.toml","uv.lock"],"timeout_seconds":600,"purpose":"Batch-vs-single equivalence and service end-to-end with batching."}]}
