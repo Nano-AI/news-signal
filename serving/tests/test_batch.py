@@ -27,3 +27,28 @@ def test_batch_matches_single(clf):
     for h, (d, c) in zip(heads, batch):
         d1, c1 = clf.predict(h)
         assert d == d1 and abs(c - c1) < 1e-4
+
+
+def test_bucket_selection():
+    from serving.model import pick_bucket
+
+    assert pick_bucket(1, 1) == (1, 16)
+    assert pick_bucket(3, 17) == (4, 32)
+    assert pick_bucket(33, 64) == (64, 64)
+    assert pick_bucket(64, 49) == (64, 64)
+    with pytest.raises(ValueError):
+        pick_bucket(65, 10)
+
+
+def test_padding_to_bucket_matches_unpadded(clf):
+    from serving.model import pad_to_bucket, pick_bucket
+
+    heads = ["stocks rally", "company earnings beat the guidance rises", "fall"]
+    enc = clf.tokenizer(heads, return_tensors="pt", padding=True, truncation=True, max_length=64)
+    b, seq = pick_bucket(*enc["input_ids"].shape)
+    padded = pad_to_bucket(enc, b, seq, clf.tokenizer.pad_token_id)
+    assert padded["input_ids"].shape == (b, seq)
+    with torch.inference_mode():
+        ref = torch.softmax(clf.model(**enc).logits, -1)
+        got = torch.softmax(clf.model(**padded).logits, -1)[: len(heads)]
+    assert torch.allclose(ref, got, atol=1e-5)
