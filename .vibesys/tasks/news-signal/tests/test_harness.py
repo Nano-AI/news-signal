@@ -565,7 +565,7 @@ def test_freeze_rewrites_task_files_idempotently(freezer):
 
     def freeze() -> dict:
         fz.freeze()
-        return {n: (task / n).read_bytes() for n in ("gate.toml", "objectives.toml", "OBJECTIVE.md")}
+        return {n: (task / n).read_bytes() for n in ("gate.toml", "objectives.toml", "REFERENCE.md")}
 
     first = freeze()
     base = tomllib.loads(first["gate.toml"].decode())["baseline"]
@@ -576,8 +576,8 @@ def test_freeze_rewrites_task_files_idempotently(freezer):
     assert "ms_per_headline" not in base
     assert b"PLACEHOLDER" not in first["gate.toml"]
     assert tomllib.loads(first["objectives.toml"].decode())["pareto"]["relative_noise"] == 0.04
-    assert b"agreement 0.9995, Spearman 0.9991" in first["OBJECTIVE.md"] and b"(record only): 0.04" in first["OBJECTIVE.md"]
-    assert b"Pending" not in first["OBJECTIVE.md"] and b"commit `" in first["OBJECTIVE.md"]
+    assert b"agreement 0.9995, Spearman 0.9991" in first["REFERENCE.md"] and b"(record only): 0.04" in first["REFERENCE.md"]
+    assert b"Pending" not in first["REFERENCE.md"] and b"commit `" in first["REFERENCE.md"]
     assert freeze() == first
 
 
@@ -619,7 +619,7 @@ def test_freeze_records_both_bursts_values_and_the_confidence_spearman(freezer):
     task = repo / ".vibesys" / "tasks" / "news-signal"
     base = tomllib.loads((task / "gate.toml").read_text())["baseline"]
     assert base["bursts_agreement"] == [0.996, 0.996] and base["bursts_spearman"] == [0.97, 0.97]
-    md = (task / "OBJECTIVE.md").read_text()
+    md = (task / "REFERENCE.md").read_text()
     assert "Spearman 0.9700 and 0.9700" in md and "within-sign confidence Spearman 0.8800" in md
     assert "confidence_spearman" not in (task / "gate.toml").read_text()  # record only
 
@@ -1382,7 +1382,7 @@ def test_freeze_surfaces_record_only_stats_without_touching_decisions(freezer):
     gate_before = None
     fz.freeze()
     gate_before = (task / "gate.toml").read_bytes()
-    md = (task / "OBJECTIVE.md").read_text()
+    md = (task / "REFERENCE.md").read_text()
     assert "### Baseline (record only)" in md and "peak GPU memory 4096 MiB" in md and "model load (spawn to ready) 12.5 s" in md
     assert "feed `benzinga`: 900 pairs" in md and "first on 60 stories" in md and "max 30.0" in md
     assert "throughput 50.0 signals/s" in md
@@ -1420,7 +1420,7 @@ def test_freeze_without_record_only_sidecars_writes_nulls(freezer):
     _, fz, runs, _ = freezer
     _artifacts(fz, runs, sidecars=False)
     fz.freeze()
-    md = (freezer[3] / ".vibesys" / "tasks" / "news-signal" / "OBJECTIVE.md").read_text()
+    md = (freezer[3] / ".vibesys" / "tasks" / "news-signal" / "REFERENCE.md").read_text()
     assert "Bursts run 1: latency p50 10.0" in md and "model load (spawn to ready) null" in md
 
 

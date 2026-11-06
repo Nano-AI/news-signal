@@ -129,7 +129,7 @@ forbid all three. `scripts/wrapper_probe.py` checks the wrapper on a GPU node (s
 | `infosys/` | Evaluator: fetch, build, store, replay, `newsd`, score, and a synthetic fixture. |
 | `infosys/fixtures/tiny/` | A small synthetic event store for tests and the CPU check. |
 | `serving/` | The candidate: baseline FinBERT service and `prepare`. |
-| `.vibesys/tasks/news-signal/` | The VibeSys task: `OBJECTIVE.md`, `vibesys.input.toml`, `objectives.toml`, `gate.toml`, `passrun.py`, `accuracy_checker/`, `benchmark/`, `cpu_check/`, `data.manifest.json`. |
+| `.vibesys/tasks/news-signal/` | The VibeSys task: `OBJECTIVE.md`, `REFERENCE.md`, `vibesys.input.toml`, `objectives.toml`, `gate.toml`, `passrun.py`, `accuracy_checker/`, `benchmark/`, `cpu_check/`, `data.manifest.json`. |
 | `scripts/freeze_baseline.py` | Measures the baseline on real data and freezes the gate. |
 | `scripts/wrapper_probe.py` | GPU probe of the hiding wrapper. |
 | `scripts/scan_publish.py` | Pre-publish scan for paths, secrets and data files. |
@@ -228,7 +228,7 @@ The script is idempotent and uses only the standard library. Its stages, in orde
 | `probe` | Not in the default run. A GPU job that checks the hiding wrapper. Run it with `--stages probe`. |
 | `f1` | GPU job: the accuracy checker on the baseline, in report mode. The freeze stops if the GPU baseline's agreement is under 0.99 or its Spearman under 0.95 against the CPU reference. |
 | `f2` | GPU job: the bursts benchmark, twice. Each pass's agreement is recorded. |
-| `freeze` | Writes `gate.toml`, `objectives.toml` and the baseline section of `OBJECTIVE.md`. |
+| `freeze` | Writes `gate.toml`, `objectives.toml` and the baseline section of `REFERENCE.md`. |
 
 A stage's output is reused only if the commit, digests, H and `passrun.py` are unchanged. `--force STAGE`
 redoes one stage and `--stages a,b` runs a subset. The script keeps the id of each submitted job until its
@@ -240,7 +240,7 @@ cluster address and paths from its own output. Details are in the docstring of
 
 The baseline is pending. No real data has been pulled yet, so `gate.toml` holds placeholder values and
 `frozen = false`. Running `scripts/freeze_baseline.py` after the data pull fills `gate.toml` and the baseline
-section of `.vibesys/tasks/news-signal/OBJECTIVE.md` with: the reference pair count and digest, the baseline's own
+section of `.vibesys/tasks/news-signal/REFERENCE.md` with: the reference pair count and digest, the baseline's own
 agreement and Spearman, IC and its standard error (record only), the horizon H, validation stories and scored
 pairs, the baseline p99 latency on two runs, and the relative noise. This section will then list them.
 

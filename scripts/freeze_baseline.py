@@ -19,7 +19,7 @@ passrun.py; `--force STAGE[,STAGE]` redoes one; `--stages a,b` limits the run):
     f1        GPU job: the accuracy checker on the baseline, with the gate's own drain (report mode); the freeze
               stops unless it agrees with the CPU reference (agreement >= 0.99, Spearman >= 0.95)
     f2        GPU job: the bursts benchmark, twice; the freeze stops like F1 if either misses a floor
-    freeze    write gate.toml, objectives.toml and the OBJECTIVE.md baseline section; print the numbers
+    freeze    write gate.toml, objectives.toml and the REFERENCE.md baseline section; print the numbers
 
 There is no sizing stage: MAX_STORIES is a committed constant in passrun.py (30000, above the 19001-story validation
 split), so nothing is left for the freeze to decide.
@@ -46,8 +46,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TASK = ROOT / ".vibesys" / "tasks" / "news-signal"
-GATE, OBJECTIVES, PASSRUN, OBJECTIVE_MD = (
-    TASK / n for n in ("gate.toml", "objectives.toml", "passrun.py", "OBJECTIVE.md")
+GATE, OBJECTIVES, PASSRUN, REFERENCE_MD = (
+    TASK / n for n in ("gate.toml", "objectives.toml", "passrun.py", "REFERENCE.md")
 )
 HORIZONS = (5, 15, 30, 60)
 H_MINUTES = 5  # IC is record only, so the label horizon is fixed
@@ -143,7 +143,7 @@ def tree_hash(base: Path, skip: frozenset[str] = frozenset()) -> str:
 
 
 # the freeze rewrites these three; every other task file is an input of the measurements
-TASK_OUTPUTS = frozenset({"gate.toml", "OBJECTIVE.md", "objectives.toml"})
+TASK_OUTPUTS = frozenset({"gate.toml", "OBJECTIVE.md", "REFERENCE.md", "objectives.toml"})
 
 
 def task_hash() -> str:
@@ -507,7 +507,7 @@ class Freezer:
         say(f"full F1/F2/cpu-acc records written to {written.name}")
         section = (
             "## Baseline\n\n"
-            f"Unmodified `serving/` (plain FinBERT, one headline per call) at commit `{head}` on 1x MI210, "
+            f"Unmodified `serving/` at commit `{head}` on 1x MI210, "
             f"validation split, H = {tomllib.loads(GATE.read_text())['h_reason']}. "
             f"`serving/` tree {tree_hash(ROOT / 'serving')[:12]}, task files {task_hash()[:12]}{dirty_note}.\n\n"
             f"- Quality gate: agree with the original FinBERT (fp32, CPU) on at least {gate_now_top['agreement_floor']:.0%} of "
@@ -524,8 +524,8 @@ class Freezer:
             + "\n".join([*record_line("Accuracy pass (F1)", extra[0]), *record_line("Bursts run 1", extra[1]),
                          *record_line("Bursts run 2", extra[2])]) + "\n"
         )  # fmt: skip
-        md = OBJECTIVE_MD.read_text()
-        OBJECTIVE_MD.write_text(md[: md.index("## Baseline")] + section)
+        md = REFERENCE_MD.read_text()
+        REFERENCE_MD.write_text(md[: md.index("## Baseline")] + section)
         say(f"frozen at commit {head}:")
         print(json.dumps({"ic": ic, "ic_se": se, "bursts_ic": bursts_ic,
                           "f1_agreement": fid["agreement"], "f1_spearman": fid["spearman"],
