@@ -128,7 +128,16 @@ class Classifier:
         side = torch.cuda.Stream()
         keys = ("input_ids", "token_type_ids", "attention_mask")
         pad = self.tokenizer.pad_token_id
-        # SDPA path probe: fall back to explicit attention if it fails at any bucket.
+        # Decide the attention path once, before any bucket is captured: SDPA if it runs, else explicit
+        # matmul-softmax-matmul. All buckets then capture the same path (self.fused.use_sdpa records it).
+        try:
+            with torch.inference_mode():
+                z = torch.zeros(1, 16, dtype=torch.long, device=self.device)
+                self.fused.forward(z, z, torch.ones_like(z))
+                torch.cuda.synchronize()
+            self.fused.use_sdpa = True
+        except RuntimeError:
+            self.fused.use_sdpa = False
         for b in BATCH_BUCKETS:
             for seq in SEQ_BUCKETS:
                 dev = torch.zeros(3, b, seq, dtype=torch.long, device=self.device)
@@ -139,13 +148,8 @@ class Classifier:
                 with torch.inference_mode():
                     side.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(side):
-                        try:
-                            for _ in range(3):
-                                fwd()
-                        except RuntimeError:
-                            self.fused.use_sdpa = False
-                            for _ in range(3):
-                                fwd()
+                        for _ in range(3):
+                            fwd()
                     torch.cuda.current_stream().wait_stream(side)
                     torch.cuda.synchronize()
                     g = torch.cuda.CUDAGraph()
