@@ -52,3 +52,42 @@ def test_padding_to_bucket_matches_unpadded(clf):
         ref = torch.softmax(clf.model(**enc).logits, -1)
         got = torch.softmax(clf.model(**padded).logits, -1)[: len(heads)]
     assert torch.allclose(ref, got, atol=1e-5)
+
+
+HEADS50 = [" ".join(["stocks rally fall earnings beat miss the a of as and guidance rises sharply company".split()[(i * 7 + j * 3) % 15]
+                     for j in range(1 + (i * 13) % 90)]) for i in range(50)]
+
+
+def test_arrival_ids_match_padded_tokenizer(clf):
+    import numpy as np
+    from serving.model import MAX_LENGTH, pick_bucket
+
+    enc = clf.tokenizer(HEADS50, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH)
+    assert max(len(clf.tokenize(h)) for h in HEADS50) == MAX_LENGTH
+    n, length = enc["input_ids"].shape
+    b, seq = pick_bucket(n, length)
+    ref = np.zeros((3, b, seq), dtype=np.int64)
+    ref[0] = clf.tokenizer.pad_token_id
+    ref[0, :n, :length] = enc["input_ids"].numpy()
+    ref[2, :n, :length] = enc["attention_mask"].numpy()
+    ids_list = [clf.tokenize(h) for h in HEADS50]
+    got = np.zeros((3, b, seq), dtype=np.int64)
+    got[0] = clf.tokenizer.pad_token_id
+    for i, x in enumerate(ids_list):
+        got[0, i, : len(x)] = x
+        got[2, i, : len(x)] = 1
+    assert (got == ref).all()
+
+
+def test_predict_ids_matches_predict_batch_and_skips_tokenizer(clf, monkeypatch):
+    heads = HEADS50[:6]
+    ids = [clf.tokenize(h) for h in heads]
+    ref = clf.predict_batch(heads)
+
+    def boom(*a, **k):
+        raise AssertionError("tokenizer called")
+
+    monkeypatch.setattr(clf, "tokenizer", boom)
+    got = clf.predict_ids(ids)
+    assert [d for d, _ in got] == [d for d, _ in ref]
+    assert all(abs(a - b) < 1e-6 for (_, a), (_, b) in zip(got, ref))

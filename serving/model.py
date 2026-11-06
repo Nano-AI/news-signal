@@ -2,6 +2,7 @@
 
 import sys
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -128,6 +129,9 @@ class Classifier:
         self._graphs: dict[tuple[int, int], tuple] = {}
         self._pool = None
         self.fused = FusedBert(self.model) if device == "cuda" else None
+        self._np: dict = {}
+        self._pad_id = self.tokenizer.pad_token_id
+        self._id_dir = {int(i): label_direction(l) for i, l in self.model.config.id2label.items()}
 
     def predict(self, headline: str) -> tuple[int, float]:
         enc = self.tokenizer(headline, return_tensors="pt", truncation=True, max_length=64)
@@ -211,33 +215,56 @@ class Classifier:
         print("graph arms (S=sdpa E=explicit H=hf): " +
               " ".join(f"{b}x{s}:{short[a]}" for (b, s), a in chosen.items()), file=sys.stderr, flush=True)
 
-    def _predict_graph(self, enc) -> torch.Tensor:
-        n, length = enc["input_ids"].shape
-        b, seq = pick_bucket(n, length)
+    def tokenize(self, headline: str) -> list[int]:
+        """Token ids (with special tokens, truncated, unpadded) for one headline."""
+        return self.tokenizer(headline, truncation=True, max_length=MAX_LENGTH)["input_ids"]
+
+    def _host_np(self, key, host):
+        v = self._np.get(key)
+        if v is None:
+            v = self._np[key] = host.numpy()
+        return v
+
+    def _predict_graph_ids(self, ids_list) -> list[tuple[int, float]]:
+        n = len(ids_list)
+        b, seq = pick_bucket(n, max(map(len, ids_list)))
         g, dev, host, out, out_host = self._graphs[(b, seq)]
-        host[0].fill_(self.tokenizer.pad_token_id)
-        host[1:].zero_()
-        for i, k in enumerate(("input_ids", "token_type_ids", "attention_mask")):
-            host[i, :n, :length] = enc[k]
+        h = self._host_np((b, seq), host)
+        h[0].fill(self._pad_id)
+        h[1:] = 0
+        ids, mask = h[0], h[2]
+        for i, x in enumerate(ids_list):
+            m = len(x)
+            ids[i, :m] = x
+            mask[i, :m] = 1
         dev.copy_(host, non_blocking=True)
         g.replay()
         out_host.copy_(out, non_blocking=True)
         torch.cuda.current_stream().synchronize()
-        return out_host[:n].clone()
+        probs = self._host_np(("out", b, seq), out_host)[:n]
+        idx = probs.argmax(axis=-1)
+        conf = probs[np.arange(n), idx].tolist()
+        dirs = self._id_dir
+        return [(dirs[i], c) for i, c in zip(idx.tolist(), conf)]
 
-    def predict_batch(self, headlines: list[str]) -> list[tuple[int, float]]:
-        enc = self.tokenizer(headlines, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH)
+    def predict_ids(self, ids_list: list[list[int]]) -> list[tuple[int, float]]:
         if self.device == "cuda":
-            probs = self._predict_graph(enc)
-            conf, idx = probs.max(dim=-1)
-            id2label = self.model.config.id2label
-            return [(label_direction(id2label[i]), c) for i, c in zip(idx.tolist(), conf.tolist())]
+            return self._predict_graph_ids(ids_list)
+        n, length = len(ids_list), max(map(len, ids_list))
+        ids = torch.full((n, length), self._pad_id, dtype=torch.long)
+        mask = torch.zeros(n, length, dtype=torch.long)
+        for i, x in enumerate(ids_list):
+            ids[i, : len(x)] = torch.tensor(x, dtype=torch.long)
+            mask[i, : len(x)] = 1
+        enc = {"input_ids": ids, "attention_mask": mask, "token_type_ids": torch.zeros_like(ids)}
         enc = {k: v.to(self.device) for k, v in enc.items()}
         with torch.inference_mode():
             probs = torch.softmax(self.model(**enc).logits, dim=-1)
         conf, idx = probs.max(dim=-1)
-        id2label = self.model.config.id2label
-        return [(label_direction(id2label[i]), c) for i, c in zip(idx.tolist(), conf.tolist())]
+        return [(self._id_dir[i], c) for i, c in zip(idx.tolist(), conf.tolist())]
+
+    def predict_batch(self, headlines: list[str]) -> list[tuple[int, float]]:
+        return self.predict_ids([self.tokenize(h) for h in headlines])
 
     def warmup(self) -> None:
         if self.device == "cuda":

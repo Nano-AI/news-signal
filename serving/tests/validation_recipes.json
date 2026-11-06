@@ -21,7 +21,7 @@
     "serving/tests/test_batch.py"
    ],
    "timeout_seconds": 600,
-   "purpose": "predict_batch on mixed-length headlines matches per-item predict (same direction, confidence within 1e-4) on a tiny random BERT. Skips (exit 0) only when torch/transformers cannot be imported; any test failure fails the recipe."
+   "purpose": "predict_batch/predict_ids on mixed-length headlines matches per-item predict (same direction, confidence within 1e-4) on a tiny random BERT. Skips (exit 0) only when torch/transformers cannot be imported; any test failure fails the recipe."
   },
   {
    "name": "fused-equivalence",

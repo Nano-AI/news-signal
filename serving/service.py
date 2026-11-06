@@ -1,6 +1,7 @@
 """Baseline service: subscribe to every feed, classify each new story, post one signal per ticker."""
 
 import asyncio
+import json
 import queue
 import sys
 import threading
@@ -67,17 +68,20 @@ def _infer_loop(inq: queue.Queue, classify_batch, loop, on_batch, finished: asyn
                     done = True
                     break
                 batch.append(item)
-            results = classify_batch([s["headline"] for s in batch])
-            loop.call_soon_threadsafe(on_batch, batch, results)
+            results = classify_batch([ids for _, ids in batch])
+            loop.call_soon_threadsafe(on_batch, [s for s, _ in batch], results)
     except BaseException as e:
         loop.call_soon_threadsafe(finished.set_exception, e)
         return
     loop.call_soon_threadsafe(finished.set_result, None)
 
 
-async def _post(session, base: str, sigs: list[dict]) -> bool:
-    """POST one batch; False when the run is already finished (409)."""
-    async with session.post(base + "/signals", json={"signals": sigs}) as r:
+_JSON = {"Content-Type": "application/json"}
+
+
+async def _post(session, base: str, body: bytes) -> bool:
+    """POST one pre-serialised batch; False when the run is already finished (409)."""
+    async with session.post(base + "/signals", data=body, headers=_JSON) as r:
         if r.status == 409:
             return False
         if r.status != 200:
@@ -88,7 +92,10 @@ async def _post(session, base: str, sigs: list[dict]) -> bool:
     return True
 
 
-async def run(newsd_url: str, classify_batch: Callable[[list[str]], list[tuple[int, float]]]) -> None:
+async def run(newsd_url: str, classify_batch: Callable[[list], list[tuple[int, float]]],
+              tokenize: Callable[[str], object] = lambda h: h) -> None:
+    """tokenize runs at arrival in the event loop; classify_batch receives its outputs."""
+    sys.setswitchinterval(0.0002)
     base = newsd_url.rstrip("/")
     loop = asyncio.get_running_loop()
     inq: queue.Queue = queue.Queue()
@@ -100,10 +107,10 @@ async def run(newsd_url: str, classify_batch: Callable[[list[str]], list[tuple[i
     def on_story(story: dict) -> None:
         if story["story_id"] not in seen:
             seen.add(story["story_id"])
-            inq.put(story)
+            inq.put((story, tokenize(story["headline"])))
 
-    async def post_task(sigs):
-        if not await _post(session, base, sigs):
+    async def post_task(body):
+        if not await _post(session, base, body):
             stopped.set()
 
     def on_post_done(t: asyncio.Task) -> None:
@@ -118,7 +125,9 @@ async def run(newsd_url: str, classify_batch: Callable[[list[str]], list[tuple[i
             for t in s["tickers"]
         ]
         for i in range(0, len(sigs), MAX_POST):
-            task = asyncio.create_task(post_task(sigs[i : i + MAX_POST]))
+            task = asyncio.create_task(
+                post_task(json.dumps({"signals": sigs[i : i + MAX_POST]}).encode())
+            )
             posts.add(task)
             task.add_done_callback(posts.discard)
             task.add_done_callback(on_post_done)
